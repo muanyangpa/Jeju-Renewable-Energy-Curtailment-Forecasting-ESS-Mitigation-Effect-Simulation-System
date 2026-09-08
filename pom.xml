@@ -12,10 +12,10 @@
     </parent>
 
     <groupId>com.ami</groupId>
-    <artifactId>anomaly-backend</artifactId>
+    <artifactId>curtailment-backend</artifactId>
     <version>0.0.1-SNAPSHOT</version>
-    <name>ami-anomaly-backend</name>
-    <description>AMI 이상탐지 프로젝트 - Backend (Spring Boot)</description>
+    <name>curtailment-backend</name>
+    <description>제주 재생에너지 출력제어 예측 및 ESS 완화효과 시뮬레이션 - Backend (Spring Boot)</description>
 
     <properties>
         <java.version>21</java.version>

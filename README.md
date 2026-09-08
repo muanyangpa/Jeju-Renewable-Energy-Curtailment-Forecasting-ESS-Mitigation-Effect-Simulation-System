@@ -1,88 +1,56 @@
-# AMI 이상탐지 프로젝트 — Backend (Spring Boot)
+# 제주 출력제어 예측 프로젝트 — Backend (Spring Boot)
 
 담당: 이성헌 | 스택: Java 21, Spring Boot 3.3, PostgreSQL
+AMI 프로젝트 뼈대(ami-backend)를 재사용해 새 도메인에 맞게 재구성함.
 
 ## 폴더 구조
 
 ```
-src/main/java/com/ami/anomaly/
-├── domain/          # Entity (Meter, AnomalyResult, ViolationType)
-├── repository/      # JPA Repository
-├── controller/      # 외부 노출 REST API (AnomalyController, MeterController)
-├── service/         # 비즈니스 로직 (AiClientService - Python 서버 호출)
-├── config/          # 설정 (SecurityConfig, WebClientConfig)
-└── dto/             # Python AI 서버와 주고받는 요청/응답 객체
+domain/       Region, EnergySource(SOLAR/WIND), PowerGeneration,
+              CurtailmentPrediction, EssSimulationResult
+repository/   각 Entity의 JPA Repository
+controller/   RegionController, CurtailmentPredictionController,
+              EssSimulationController — 외부 노출 API
+service/      AiClientService(Python 호출), EssSimulationService(흡수율 계산)
+dto/          PredictionRequest/Response — Python AI 서버와 주고받을 통신규격 초안
 ```
+
+## 계획서 대응 관계
+
+- **04장 01 (출력제어 확률 예측 엔진)** → `CurtailmentPredictionController`,
+  `AiClientService`
+- **04장 02·03 (ESS 충방전 시뮬레이션 / 용량 조정 시뮬레이터)** →
+  `EssSimulationService.simulate()` — 07장의 `min(그 시각 제어량, ESS 정격출력)`
+  계산을 그대로 구현. 대시보드 슬라이더가 `essCapacityMw`만 바꿔서 반복 호출하면
+  별도 모델 없이 즉시 재계산됨(04장 03 요구사항).
+
+## ⚠️ 카톡으로 논의 후 확정해야 할 것 (통신규격)
+
+`dto/PredictionRequest.java`, `dto/PredictionResponse.java`는 초안입니다.
+지호님과 논의해서 아래를 확정한 뒤 수정 필요:
+
+1. **`forecastGenerationMwh`**: 기상청 예보 기반 발전량 예측치를 Backend가
+   미리 받아서 보낼지, AI 서버가 자체적으로 계산할지
+2. **`demandMwh`**: 풍력만 쓰는 필드인데, 태양광 요청 시 이 필드를 아예
+   생략할지 null로 보낼지
+3. **시간·월 sin/cos 변환**: 계획서 04장에 모델 입력이 "시간(sin/cos)·
+   월(sin/cos)"로 되어 있는데, 이 변환을 Backend에서 미리 해서 보낼지
+   AI 서버가 `targetHour`만 받아서 자체 계산할지
+4. **`excessGenerationMwh`(초과발전량)**: AI 서버가 분류 확률과 함께 이 값도
+   같이 내려줄지, 아니면 Backend가 발전량-수요 차이로 별도 계산할지
 
 ## 실행 방법
 
-1. **로컬에 PostgreSQL 설치 후 DB 생성**
+1. PostgreSQL에 DB 생성
    ```sql
-   CREATE DATABASE ami_db;
+   CREATE DATABASE curtailment_db;
    ```
+2. `application.yml`에서 비밀번호 설정
+3. IntelliJ에서 실행 (JDK 21 필요 — AMI 때와 동일하게 Project Structure에서 확인)
 
-2. `src/main/resources/application.yml`에서 DB 계정 정보 본인 환경에 맞게 수정
+## 지금 상태
 
-3. IntelliJ / VS Code + Java Extension Pack으로 프로젝트 열기
-   (또는 터미널에서 `mvn spring-boot:run`, Maven 설치 필요)
-
-4. 실행 후 `http://localhost:8080/api/meters` 로 확인
-
-## 지금 당장 할 수 있는 것 (AI 담당자 확정 전)
-
-- [x] 프로젝트 뼈대 (Entity, Repository, Controller, Security)
-- [ ] Meter, AnomalyResult 저장/조회 API 테스트
-- [ ] Postman 등으로 API 동작 확인
-- [ ] Swagger(springdoc-openapi) 추가해서 API 문서 자동화 (선택)
-
-## IoT 파트 — AMI 데이터 수신 & 시뮬레이터
-
-실제 스마트 계량기가 없으므로, `simulator/simulate_ami.py`가 계량기 역할을 대신해서
-Backend로 데이터를 흘려보낸다.
-
-### 흐름
-```
-[시뮬레이터(계량기 역할)] --POST--> [MeterReadingController] --저장--> [DB]
-                                                              --조회(최근 96개)--> [AI 판정 요청 시 사용]
-```
-
-### 사용 순서
-1. Backend 실행 후, `POST /api/meters`로 테스트 세대 하나 먼저 등록
-   ```json
-   { "consumerNo": "1001", "contractPowerKw": 5.0, "idleRequested": false, "reservePowerContract": false }
-   ```
-2. 시뮬레이터 의존성 설치
-   ```
-   cd simulator
-   pip install -r requirements.txt
-   ```
-3. 가상 데이터 전송 시작 (2초 간격, 5% 확률로 이상치 주입)
-   ```
-   python simulate_ami.py --mode synthetic --consumer 1001 --interval 2
-   ```
-4. 저장된 데이터 확인
-   ```
-   GET http://localhost:8080/api/meters/1001/readings/recent
-   ```
-
-### 실제 데이터셋(SGCC 등)으로 돌리고 싶을 때
-`--mode csv --csv 파일경로`로 실행. 단, SGCC 원본은 날짜가 컬럼으로 나열된 형태라
-`recorded_at,usage_kwh` 두 컬럼 포맷으로 변환하는 전처리가 먼저 필요함 (AI 담당자 합류 후 협의).
-
-
-
-`dto/AiPredictRequest.java`, `dto/AiPredictResponse.java`가 Spring Boot ↔ Python 간
-통신 규격 **초안**입니다. 실제 필드명/형식은 AI 담당자와 반드시 합의 후 수정하세요.
-
-- `loadSeries`: 시계열 데이터 포맷 (몇 포인트? 15분 단위 96개?)
-- `violationType`: AI가 내려주는 문자열이 `ViolationType` enum 값과 정확히 일치해야 함
-- `explanation`: SHAP 결과를 어떤 형식(JSON? 텍스트?)으로 줄지
-
-`service/AiClientService.java`의 `/predict` 경로도 Python 쪽 FastAPI 라우트와
-맞춰서 수정 필요.
-
-## 보안 설정 관련
-
-`SecurityConfig`는 현재 `permitAll()`로 전부 열어둔 데모 상태입니다.
-팀/발표 일정에 여유가 있으면 JWT 기반 인증 정도는 추가해서
-"보안에 강한 Java"라는 제안 취지를 실제로 보여주는 게 좋습니다.
+- [x] Entity/Repository/Controller 뼈대
+- [x] ESS 흡수율 계산 로직(07장 공식 그대로 구현)
+- [ ] 통신규격 확정 (위 4가지 항목 — 카톡 논의 후 dto 수정)
+- [ ] 로컬 실행 테스트 (AMI 때처럼 PostgreSQL 연결 후 API 테스트 필요)

@@ -1,4 +1,4 @@
-package com.ami.anomaly.config;
+package com.ami.curtailment.config;
 
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.annotation.Bean;
