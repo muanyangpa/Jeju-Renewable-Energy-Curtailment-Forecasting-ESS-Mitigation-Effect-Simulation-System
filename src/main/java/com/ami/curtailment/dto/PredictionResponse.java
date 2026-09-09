@@ -4,13 +4,19 @@ import lombok.Getter;
 import lombok.NoArgsConstructor;
 import lombok.Setter;
 
+import java.util.List;
+
 /**
- * Python AI 서버 -> Spring Boot 응답 (통신규격 초안)
+ * Python AI 서버 -> Spring Boot 배치 응답 (통신규격 확정서 v1.0, 03장)
  */
 @Getter
 @Setter
 @NoArgsConstructor
 public class PredictionResponse {
-    private double curtailmentProbability; // 출력제어 확률 (0~1)
-    private Double excessGenerationMwh;    // 초과발전량 크기 — ESS 충전량 계산용 (04장)
+    private String regionName;
+    private String energySource;
+    private String targetDate;
+    private String modelVersion;              // 재현성 추적용 - 발표 시 근거 자료
+    private boolean curtailmentMwhAvailable;   // SOLAR면 false. false면 predictions[].curtailmentMwh 전부 null
+    private List<HourlyPrediction> predictions; // 24개(0~23시)
 }

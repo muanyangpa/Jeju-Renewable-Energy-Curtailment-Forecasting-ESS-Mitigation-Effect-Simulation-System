@@ -1,43 +1,45 @@
 # 제주 출력제어 예측 프로젝트 — Backend (Spring Boot)
 
 담당: 이성헌 | 스택: Java 21, Spring Boot 3.3, PostgreSQL
-AMI 프로젝트 뼈대(ami-backend)를 재사용해 새 도메인에 맞게 재구성함.
+통신규격 확정서 v1.0 (2026.09.08, 지호 작성) 반영 완료.
 
 ## 폴더 구조
 
 ```
 domain/       Region, EnergySource(SOLAR/WIND), PowerGeneration,
-              CurtailmentPrediction, EssSimulationResult
+              CurtailmentPrediction(필드명 정정: curtailmentMwh),
+              EssSimulationResult
 repository/   각 Entity의 JPA Repository
-controller/   RegionController, CurtailmentPredictionController,
-              EssSimulationController — 외부 노출 API
-service/      AiClientService(Python 호출), EssSimulationService(흡수율 계산)
-dto/          PredictionRequest/Response — Python AI 서버와 주고받을 통신규격 초안
+controller/   RegionController, CurtailmentPredictionController(/daily, /hourly),
+              EssSimulationController(/api/v1/ess/simulate), HealthController
+service/      AiClientService(배치/단건/헬스체크 호출), EssSimulationService
+dto/          PredictionRequest/Response, WeatherHour, HourlyPrediction,
+              HourlyPredictionRequest/Response, ErrorResponse
+config/       SecurityConfig, WebClientConfig, GlobalExceptionHandler(AI 서버 에러 전달)
 ```
 
-## 계획서 대응 관계
+## 확정된 통신규격 반영 내역
 
-- **04장 01 (출력제어 확률 예측 엔진)** → `CurtailmentPredictionController`,
-  `AiClientService`
-- **04장 02·03 (ESS 충방전 시뮬레이션 / 용량 조정 시뮬레이터)** →
-  `EssSimulationService.simulate()` — 07장의 `min(그 시각 제어량, ESS 정격출력)`
-  계산을 그대로 구현. 대시보드 슬라이더가 `essCapacityMw`만 바꿔서 반복 호출하면
-  별도 모델 없이 즉시 재계산됨(04장 03 요구사항).
+- `excessGenerationMwh` → **`curtailmentMwh`**로 필드명 정정 (개념이 "초과발전량"이
+  아니라 "출력제어량"이었다는 지적 반영, Entity 포함)
+- `forecastGenerationMwh`, sin/cos 변환 전부 **AI 서버가 계산** — Backend는
+  기상 원본(`WeatherHour`)과 조회 조건만 전달
+- 배치 엔드포인트 `/api/v1/predictions/daily`가 주 경로 (대시보드 기본 화면),
+  단건 `/api/v1/predictions/hourly`는 재조회·디버깅용으로 병행
+- `curtailmentMwhAvailable` 플래그 추가 — SOLAR는 항상 false, Frontend가 이 값
+  보고 ESS 시뮬레이션 화면을 비활성 처리해야 함
+- `modelVersion` 필드 추가 — 발표 시 재현성 근거로 사용
+- `/api/v1/ess/simulate` — ESS 슬라이더 what-if 계산 (07장 min() 공식 그대로,
+  curtailmentMwh 정의를 CurtailmentPrediction과 동일하게 맞춤)
+- AI 서버 에러(400/503)를 `GlobalExceptionHandler`가 그대로 전달(pass-through)
 
-## ⚠️ 카톡으로 논의 후 확정해야 할 것 (통신규격)
+## 아직 지호님과 확인이 필요한 것
 
-`dto/PredictionRequest.java`, `dto/PredictionResponse.java`는 초안입니다.
-지호님과 논의해서 아래를 확정한 뒤 수정 필요:
-
-1. **`forecastGenerationMwh`**: 기상청 예보 기반 발전량 예측치를 Backend가
-   미리 받아서 보낼지, AI 서버가 자체적으로 계산할지
-2. **`demandMwh`**: 풍력만 쓰는 필드인데, 태양광 요청 시 이 필드를 아예
-   생략할지 null로 보낼지
-3. **시간·월 sin/cos 변환**: 계획서 04장에 모델 입력이 "시간(sin/cos)·
-   월(sin/cos)"로 되어 있는데, 이 변환을 Backend에서 미리 해서 보낼지
-   AI 서버가 `targetHour`만 받아서 자체 계산할지
-4. **`excessGenerationMwh`(초과발전량)**: AI 서버가 분류 확률과 함께 이 값도
-   같이 내려줄지, 아니면 Backend가 발전량-수요 차이로 별도 계산할지
+- `weather` 배열 24개 검증(개수·중복 등, `INVALID_HOUR_SET`)을 AI 서버가
+  전담하는지, Backend가 미리 걸러줘야 하는지 — 현재는 AI 서버 전담으로 가정하고
+  Backend는 그대로 전달만 함
+- `curtailmentMwhAvailable=false`일 때 Frontend UX(화면 숨김 vs 비활성 표시)
+- ESS 슬라이더(`essCapacityMw`) 범위 — Frontend 작업 시 결정 필요
 
 ## 실행 방법
 
@@ -46,11 +48,14 @@ dto/          PredictionRequest/Response — Python AI 서버와 주고받을 �
    CREATE DATABASE curtailment_db;
    ```
 2. `application.yml`에서 비밀번호 설정
-3. IntelliJ에서 실행 (JDK 21 필요 — AMI 때와 동일하게 Project Structure에서 확인)
+3. IntelliJ에서 실행 (JDK 21 필요)
+4. 지호님이 AI 서버 스텁(고정값 반환)을 올려주면, `ai-server.base-url`
+   (기본 `http://localhost:8000`)에 맞춰 연동 테스트 가능
 
 ## 지금 상태
 
-- [x] Entity/Repository/Controller 뼈대
-- [x] ESS 흡수율 계산 로직(07장 공식 그대로 구현)
-- [ ] 통신규격 확정 (위 4가지 항목 — 카톡 논의 후 dto 수정)
-- [ ] 로컬 실행 테스트 (AMI 때처럼 PostgreSQL 연결 후 API 테스트 필요)
+- [x] Entity/Repository/Controller/DTO — 확정 스펙(v1.0) 전체 반영
+- [x] ESS 흡수율 계산 로직(07장 공식)
+- [x] AI 서버 에러 pass-through 처리
+- [ ] AI 서버 스텁 연동 테스트 (지호님 스텁 배포 대기)
+- [ ] 로컬 실행 테스트 (PostgreSQL 연결 후 API 테스트)

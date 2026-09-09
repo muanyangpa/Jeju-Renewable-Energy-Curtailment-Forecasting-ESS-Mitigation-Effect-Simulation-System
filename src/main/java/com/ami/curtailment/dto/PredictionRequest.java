@@ -1,23 +1,24 @@
 package com.ami.curtailment.dto;
 
-import lombok.AllArgsConstructor;
 import lombok.Getter;
 import lombok.NoArgsConstructor;
+import lombok.Setter;
+
+import java.util.List;
 
 /**
- * Spring Boot -> Python AI 서버 요청 (통신규격 초안 — AI 담당자와 합의 후 확정 필요)
+ * Spring Boot -> Python AI 서버 배치 요청 (통신규격 확정서 v1.0, 03장)
+ * POST /api/v1/predictions/daily 에서 사용.
  *
- * 계획서 04장 01: 모델 입력은 "발전량(예보 기반) · 시간(sin/cos) · 월(sin/cos)"
- * 풍력은 여기에 전력수요(하루전 예보) 피처가 정식 채택됨 — demandMwh 필드로 반영.
- * 태양광은 아직 수요 피처 미채택이라 null 허용.
+ * 원칙: 모델 입력으로 들어가는 가공(발전량 변환, sin/cos 등)은 전부 AI 서버가 한다.
+ * Backend는 기상 원본과 조회 조건만 전달한다.
  */
 @Getter
+@Setter
 @NoArgsConstructor
-@AllArgsConstructor
 public class PredictionRequest {
-    private String regionName;
-    private String energySource;      // "SOLAR" / "WIND"
-    private String targetHour;        // ISO 8601, 예측 대상 시각
-    private double forecastGenerationMwh; // 기상청 예보 기반 발전량 예측치
-    private Double demandMwh;         // 하루전 전력수요 예보 (풍력만 사용, 태양광은 null)
+    private String regionName;         // 필수, 예: "제주"
+    private String energySource;       // 필수, "WIND" | "SOLAR"
+    private String targetDate;         // 필수, ISO-8601 (YYYY-MM-DD, KST) - 월 sin/cos 계산에 AI 서버가 사용
+    private List<WeatherHour> weather; // 필수, 24개(0~23시)
 }
