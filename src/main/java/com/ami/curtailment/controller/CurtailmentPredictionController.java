@@ -35,7 +35,9 @@ public class CurtailmentPredictionController {
     }
 
     /**
-     * 하루치(1~24시) 예측. AI 서버 POST /predict 호출 후 24개 결과를 각각 저장.
+     * 하루치(1~24시, 원본 데이터셋 관행 그대로) 예측. AI 서버 POST /predict 호출 후 24개 결과를 각각 저장.
+     * weather 요청 필드의 hour 값도 호출하는 쪽(Frontend 등)이 1~24 그대로 채워서 보내면 되고,
+     * Backend는 이 값을 가공하지 않고 그대로 AI 서버에 전달한다 (지호님 확인 사항).
      */
     @PostMapping
     public List<CurtailmentPrediction> predict(@RequestBody PredictionRequest request) {
@@ -52,8 +54,13 @@ public class CurtailmentPredictionController {
     private CurtailmentPrediction saveOne(Region region, LocalDate targetDate, String note, HourlyPrediction hp) {
         CurtailmentPrediction prediction = new CurtailmentPrediction();
         prediction.setRegion(region);
-        // AI 서버는 hour를 1~24로 사용 - LocalDateTime 시(hour)는 0~23이라 -1 보정
-        prediction.setTargetHour(targetDate.atStartOfDay().plusHours(hp.getHour() - 1));
+        // 원본 데이터셋 관행: 1~23시는 그날 해당 시각, 24시는 "자정"=다음날 00:00.
+        // (지호님 확인: "현재 데이터셋 파싱시에 자정 24시를 0시로 바꾸고 있는데, AI에서 이를
+        //  처리하므로 Backend는 원본 1~24 그대로 보내면 됨" — 응답 저장 시에도 같은 관행 적용)
+        LocalDateTime hourStart = (hp.getHour() == 24)
+                ? targetDate.plusDays(1).atStartOfDay()
+                : targetDate.atTime(hp.getHour(), 0);
+        prediction.setTargetHour(hourStart);
         prediction.setCurtailmentProbability(hp.getCurtailment_probability());
         prediction.setGenerationForecastMwh(hp.getGeneration_forecast_mwh());
         prediction.setCurtailmentMwh(hp.getExpected_curtailment_mwh());

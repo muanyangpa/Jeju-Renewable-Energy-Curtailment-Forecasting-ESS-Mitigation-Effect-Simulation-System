@@ -27,8 +27,9 @@ config/       SecurityConfig, WebClientConfig, GlobalExceptionHandler
 - 엔드포인트: `/predict`, `/ess/simulate` (AI 서버 실제 경로, `/api/v1/...` 아님)
 - 필드명: snake_case로 통일 (`energy_type`, `target_date`, `wind_speed`,
   `solar_rad`, `curtailment_probability`, `expected_curtailment_mwh` 등)
-- **시간 인덱스가 1~24** (기존 0~23 가정에서 수정) — `CurtailmentPredictionController`에서
-  `targetHour` 저장 시 `hour - 1`로 보정
+- **시간 인덱스가 1~24** — Backend는 원본 그대로 1~24를 주고받으며 가공하지 않음(지호님 확인).
+  저장 시에만 `CurtailmentPredictionController`에서 24시를 다음날 00:00으로 변환 (1~23시는
+  그날 해당 시각 그대로). 이전 버전의 "-1 일괄 보정"은 잘못된 가정이었어서 정정함
 - ESS 계산은 **AI 서버가 수행** — Backend는 `hourly_curtailment_mwh`, `rated_power_mw`,
   `method`를 보내고 `total_absorbed_mwh`, `absorption_rate`를 받아 저장만 함
   (이전 버전은 Backend에서 직접 min() 계산했으나 실제 구현과 역할이 달라 정정)
