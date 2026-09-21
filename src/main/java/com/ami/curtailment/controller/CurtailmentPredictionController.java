@@ -3,8 +3,6 @@ package com.ami.curtailment.controller;
 import com.ami.curtailment.domain.CurtailmentPrediction;
 import com.ami.curtailment.domain.Region;
 import com.ami.curtailment.dto.HourlyPrediction;
-import com.ami.curtailment.dto.HourlyPredictionRequest;
-import com.ami.curtailment.dto.HourlyPredictionResponse;
 import com.ami.curtailment.dto.PredictionRequest;
 import com.ami.curtailment.dto.PredictionResponse;
 import com.ami.curtailment.repository.CurtailmentPredictionRepository;
@@ -19,10 +17,10 @@ import java.util.List;
 
 /**
  * 외부 노출 API: 출력제어 예측 요청 및 결과 조회.
- * 통신규격 확정서 v1.0 04장 엔드포인트 표 반영.
+ * AI 서버 실제 엔드포인트(POST /predict) 기준 - 확정서 v1.0의 /api/v1/predictions/daily가 아님.
  */
 @RestController
-@RequestMapping("/api/v1/predictions")
+@RequestMapping("/api/predictions")
 @RequiredArgsConstructor
 public class CurtailmentPredictionController {
 
@@ -37,52 +35,29 @@ public class CurtailmentPredictionController {
     }
 
     /**
-     * 하루치(24시간) 배치 예측. 대시보드 기본 화면에서 사용하는 주 엔드포인트.
-     * AI 서버 응답의 24개 시간대를 각각 CurtailmentPrediction으로 저장.
+     * 하루치(1~24시) 예측. AI 서버 POST /predict 호출 후 24개 결과를 각각 저장.
      */
-    @PostMapping("/daily")
-    public List<CurtailmentPrediction> predictDaily(@RequestBody PredictionRequest request) {
-        Region region = regionRepository.findByName(request.getRegionName());
-        LocalDate targetDate = LocalDate.parse(request.getTargetDate());
+    @PostMapping
+    public List<CurtailmentPrediction> predict(@RequestBody PredictionRequest request) {
+        Region region = regionRepository.findByName(request.getRegion());
+        LocalDate targetDate = LocalDate.parse(request.getTarget_date());
 
-        PredictionResponse response = aiClientService.predictDaily(request);
+        PredictionResponse response = aiClientService.predict(request);
 
-        return response.getPredictions().stream()
-                .map(hp -> saveOne(region, targetDate, response, hp))
+        return response.getHourly().stream()
+                .map(hp -> saveOne(region, targetDate, response.getNote(), hp))
                 .toList();
     }
 
-    /** 단건(특정 시각) 재조회·디버깅용 */
-    @PostMapping("/hourly")
-    public CurtailmentPrediction predictHourly(@RequestBody HourlyPredictionRequest request) {
-        Region region = regionRepository.findByName(request.getRegionName());
-        LocalDate targetDate = LocalDate.parse(request.getTargetDate());
-
-        HourlyPredictionResponse response = aiClientService.predictHourly(request);
-
-        return saveOne(region, targetDate,
-                response.getModelVersion(), response.isCurtailmentMwhAvailable(),
-                response.getPrediction());
-    }
-
-    private CurtailmentPrediction saveOne(Region region, LocalDate targetDate,
-                                            PredictionResponse response, HourlyPrediction hp) {
-        return saveOne(region, targetDate, response.getModelVersion(),
-                response.isCurtailmentMwhAvailable(), hp);
-    }
-
-    private CurtailmentPrediction saveOne(Region region, LocalDate targetDate,
-                                            String modelVersion, boolean curtailmentMwhAvailable,
-                                            HourlyPrediction hp) {
+    private CurtailmentPrediction saveOne(Region region, LocalDate targetDate, String note, HourlyPrediction hp) {
         CurtailmentPrediction prediction = new CurtailmentPrediction();
         prediction.setRegion(region);
-        prediction.setTargetHour(targetDate.atTime(hp.getHour(), 0));
-        prediction.setCurtailmentProbability(hp.getCurtailmentProbability());
-        prediction.setRiskLevel(hp.getRiskLevel());
-        prediction.setForecastGenerationMwh(hp.getForecastGenerationMwh());
-        prediction.setCurtailmentMwh(hp.getCurtailmentMwh());
-        prediction.setCurtailmentMwhAvailable(curtailmentMwhAvailable);
-        prediction.setModelVersion(modelVersion);
+        // AI 서버는 hour를 1~24로 사용 - LocalDateTime 시(hour)는 0~23이라 -1 보정
+        prediction.setTargetHour(targetDate.atStartOfDay().plusHours(hp.getHour() - 1));
+        prediction.setCurtailmentProbability(hp.getCurtailment_probability());
+        prediction.setGenerationForecastMwh(hp.getGeneration_forecast_mwh());
+        prediction.setCurtailmentMwh(hp.getExpected_curtailment_mwh());
+        prediction.setNote(note);
         prediction.setPredictedAt(LocalDateTime.now());
 
         return curtailmentPredictionRepository.save(prediction);

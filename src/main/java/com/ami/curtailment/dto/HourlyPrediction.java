@@ -5,15 +5,14 @@ import lombok.NoArgsConstructor;
 import lombok.Setter;
 
 /**
- * 시간별 예측 결과 (통신규격 확정서 v1.0, 03장) - PredictionResponse.predictions 배열 요소
+ * AI 서버 응답의 hourly 배열 요소. app/schemas.py 실제 필드명 그대로.
  */
 @Getter
 @Setter
 @NoArgsConstructor
 public class HourlyPrediction {
-    private int hour;                       // 0~23
-    private double curtailmentProbability;  // 출력제어 확률 (0.0~1.0)
-    private String riskLevel;               // "HIGH" | "MEDIUM" | "LOW" (임계값은 AI 서버 관리)
-    private double forecastGenerationMwh;   // AI 서버 변환모델 산출값 (대시보드 참고 표시용)
-    private Double curtailmentMwh;          // 예상 출력제어량 - SOLAR는 항상 null
+    private int hour;                          // 1~24
+    private double generation_forecast_mwh;    // 컨버터가 산출한 발전량 예측치
+    private double curtailment_probability;    // 출력제어 확률 (0.0~1.0)
+    private Double expected_curtailment_mwh;   // 예상 출력제어량 - WIND만 값 존재, SOLAR는 항상 null
 }

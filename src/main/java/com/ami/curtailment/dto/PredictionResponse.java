@@ -7,16 +7,17 @@ import lombok.Setter;
 import java.util.List;
 
 /**
- * Python AI 서버 -> Spring Boot 배치 응답 (통신규격 확정서 v1.0, 03장)
+ * AI 서버 POST /predict 응답. app/schemas.py 실제 필드명 그대로.
+ * note는 태양광 응답에만 존재 - "expected_curtailment_mwh를 제공하지 않는다"는 안내 문구.
+ * Frontend에서 태양광 화면에 이 필드를 다룰 때 note를 반드시 같이 노출해야 함(AI 서버 README 명시).
  */
 @Getter
 @Setter
 @NoArgsConstructor
 public class PredictionResponse {
-    private String regionName;
-    private String energySource;
-    private String targetDate;
-    private String modelVersion;              // 재현성 추적용 - 발표 시 근거 자료
-    private boolean curtailmentMwhAvailable;   // SOLAR면 false. false면 predictions[].curtailmentMwh 전부 null
-    private List<HourlyPrediction> predictions; // 24개(0~23시)
+    private String energy_type;
+    private String region;
+    private String target_date;
+    private List<HourlyPrediction> hourly;
+    private String note; // solar 응답에만 존재, wind는 null
 }
