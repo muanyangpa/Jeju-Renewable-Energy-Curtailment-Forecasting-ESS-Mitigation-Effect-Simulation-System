@@ -8,6 +8,11 @@ Backend(Java/Spring Boot) <-> AI 서버(Python) REST 계약.
   - Backend: 필드 존재 여부·기본 타입만 확인 (JSON 파싱 레벨)
   - AI 서버: 도메인 규칙 검증 — "weather 배열이 정확히 24개, 시간 중복 없음" 등
     위반 시 HTTP 422 + error_code="INVALID_HOUR_SET"
+  - AI 서버: 발전원별 필수 기상값 누락 검증 [신규]
+    위반 시 HTTP 422 + error_code="MISSING_REQUIRED_FIELD"
+    (수정 전에는 누락값을 조용히 0으로 바꿔 예측했다 — 예: 풍속 null -> 풍속 0 -> '제어 없음'으로 오예측)
+
+에러 메시지 규약: ValueError("<ERROR_CODE>:<사람이 읽는 메시지>") — main.py가 코드와 메시지를 분리한다.
 """
 from __future__ import annotations
 
@@ -17,6 +22,12 @@ from typing import Literal, Optional
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 EnergyType = Literal["solar", "wind"]
+
+# 발전원별 컨버터 필수 입력 (app/training/train_converter.py의 피처와 일치해야 함)
+REQUIRED_WEATHER_FIELDS: dict[str, tuple[str, ...]] = {
+    "solar": ("solar_rad", "temp", "cloud"),
+    "wind": ("wind_speed",),
+}
 
 
 class WeatherHour(BaseModel):
@@ -53,6 +64,21 @@ class PredictRequest(BaseModel):
             raise ValueError("INVALID_HOUR_SET:demand_forecast_mw는 24개여야 합니다")
         return self
 
+    @model_validator(mode="after")
+    def _check_required_weather(self) -> "PredictRequest":
+        required = REQUIRED_WEATHER_FIELDS[self.energy_type]
+        missing = sorted(
+            {f"{w.hour}시.{f}" for w in self.weather for f in required if getattr(w, f) is None},
+            key=lambda s: (int(s.split("시")[0]), s),
+        )
+        if missing:
+            preview = ", ".join(missing[:5]) + (f" 외 {len(missing) - 5}건" if len(missing) > 5 else "")
+            raise ValueError(
+                f"MISSING_REQUIRED_FIELD:{self.energy_type} 예측에는 {', '.join(required)}가 모든 시간에 필요합니다 "
+                f"(누락: {preview})"
+            )
+        return self
+
 
 class HourlyPrediction(BaseModel):
     hour: int
@@ -68,6 +94,10 @@ class PredictResponse(BaseModel):
     region: str
     target_date: date
     hourly: list[HourlyPrediction]
+    model_used: str = Field(
+        ..., description="실제 사용된 분류모델 이름. 풍력에서 demand_forecast_mw를 생략하면 "
+                         "'classifier_wind'(수요 미포함)로 자동 전환되므로 이 값으로 확인"
+    )
     note: Optional[str] = Field(
         None, description="태양광 응답에는 expected_curtailment_mwh가 null인 이유를 항상 포함"
     )

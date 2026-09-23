@@ -3,7 +3,7 @@ AI 서버 (Python/FastAPI) — Backend(Java/Spring Boot)가 REST로 호출하는
 계획서 02장·06장·09장에서 정의한 역할: ②(날씨->발전량)·③(출력제어 확률예측) 단계를 담당하고,
 ④(ESS 충방전 결정)에 필요한 계산도 /ess/simulate로 제공한다.
 
-실행: uvicorn app.main:app --reload --port 8001
+실행: uvicorn app.main:app --reload --port 8000
 """
 from __future__ import annotations
 
@@ -22,9 +22,14 @@ app = FastAPI(
 )
 
 
+# schemas.py가 발행하는 도메인 에러코드 목록 (ValueError("<CODE>:<message>") 규약)
+DOMAIN_ERROR_CODES = ("INVALID_HOUR_SET", "MISSING_REQUIRED_FIELD")
+
+
 def _error_code_from_message(msg: str) -> tuple[str, str]:
-    if msg.startswith("INVALID_HOUR_SET:"):
-        return "INVALID_HOUR_SET", msg.split(":", 1)[1]
+    for code in DOMAIN_ERROR_CODES:
+        if msg.startswith(code + ":"):
+            return code, msg.split(":", 1)[1]
     return "VALIDATION_ERROR", msg
 
 

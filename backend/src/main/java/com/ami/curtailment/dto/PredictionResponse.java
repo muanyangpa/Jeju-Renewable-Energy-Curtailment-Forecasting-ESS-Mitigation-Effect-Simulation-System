@@ -19,5 +19,6 @@ public class PredictionResponse {
     private String region;
     private String target_date;
     private List<HourlyPrediction> hourly;
-    private String note; // solar 응답에만 존재, wind는 null
+    private String model_used; // 실제 사용된 분류모델 (예: classifier_wind_demand) - AI 서버 2026-09-23 추가
+    private String note; // solar 응답, 또는 wind에서 demand_forecast_mw 생략 시 존재
 }

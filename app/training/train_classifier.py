@@ -6,70 +6,74 @@ RandomForestClassifier(class_weight='balanced', n_estimators=200, max_depth=6)
 입력: 발전량 · 시_sin/cos · 월_sin/cos (+ 풍력은 수요 실측을 추가 피처로 정식 채택, 05장 근거)
 태양광은 수요 피처를 정식 채택하지 않는다 — 검증 가능한 표본 부족(05장).
 
+[수정 사항]
+- 학습/평가 데이터를 '출력제어 발생일만'이 아니라 전체 달력(build_labeled_hourly)으로 구성
+- 지표에 top5_ceiling / top5_precision / pr_auc / brier 추가, 상한 도달 시 경고
+- 모델 아티팩트에 메타데이터(학습 구간 등) 저장
+
 실행: python -m app.training.train_classifier
 """
 from __future__ import annotations
 
 import os
 
-import joblib
-import numpy as np
 import pandas as pd
 from sklearn.ensemble import RandomForestClassifier
-from sklearn.metrics import roc_auc_score
 
-from app.data_prep import add_time_features, load_curtailment, load_demand_actual, load_generation_actual
-
-MODELS_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "models")
+from app.data_prep import CURTAILMENT_COVERAGE, add_time_features, build_labeled_hourly, load_demand_actual
+from app.metrics import classification_report, saturation_warning
+from app.model_io import MODELS_DIR, save_artifact
 
 BASE_FEATURES = ["generation_mwh", "hour_sin", "hour_cos", "month_sin", "month_cos"]
+TEST_START, TEST_END = "2023-01-01", "2024-01-01"
 
 
-def _top5_capture(y_true: np.ndarray, y_score: np.ndarray) -> float:
-    """상위5%포착률 — 문서 전체에서 쓰는 핵심 지표(05장 정의 그대로)."""
-    n = len(y_true)
-    k = max(1, int(np.ceil(n * 0.05)))
-    top_idx = np.argsort(-y_score)[:k]
-    return float(y_true[top_idx].sum() / max(1, y_true.sum()))
+def build_dataset(energy_type: str, use_demand: bool) -> tuple[pd.DataFrame, list[str]]:
+    df = add_time_features(build_labeled_hourly(energy_type))
+    features = list(BASE_FEATURES)
+    if use_demand:
+        df = df.merge(load_demand_actual(), on="dt", how="inner")
+        features.append("demand_mw")
+    df = df.dropna(subset=features).reset_index(drop=True)
+    return df, features
+
+
+def make_model() -> RandomForestClassifier:
+    return RandomForestClassifier(class_weight="balanced", n_estimators=200, max_depth=6,
+                                  random_state=42, n_jobs=-1)
 
 
 def train_one(energy_type: str, use_demand: bool) -> dict:
-    gen = load_generation_actual(energy_type)
-    gen = add_time_features(gen)
-    curt = load_curtailment(energy_type)[["dt", "is_curtailed"]]
-    df = gen.merge(curt, on="dt", how="inner")
-
-    features = list(BASE_FEATURES)
-    if use_demand:
-        demand = load_demand_actual()
-        df = df.merge(demand, on="dt", how="inner")
-        features.append("demand_mw")
-
-    df["label"] = df["is_curtailed"].astype(int)
+    df, features = build_dataset(energy_type, use_demand)
 
     # 리키지-프리 시간분할: 2023년을 테스트로 사용 (07장 ESS 계산과 같은 기준 연도)
-    train = df[df["dt"] < "2023-01-01"]
-    test = df[df["dt"] >= "2023-01-01"]
+    train = df[df["dt"] < TEST_START]
+    test = df[(df["dt"] >= TEST_START) & (df["dt"] < TEST_END)]
 
-    model = RandomForestClassifier(class_weight="balanced", n_estimators=200, max_depth=6,
-                                    random_state=42, n_jobs=-1)
-    model.fit(train[features], train["label"])
-
+    model = make_model()
+    model.fit(train[features], train["is_curtailed"])
     proba = model.predict_proba(test[features])[:, 1]
-    y_true = test["label"].to_numpy()
-    auc = roc_auc_score(y_true, proba) if y_true.sum() > 0 else float("nan")
-    top5 = _top5_capture(y_true, proba)
+    report = classification_report(test["is_curtailed"].to_numpy(), proba)
 
-    os.makedirs(MODELS_DIR, exist_ok=True)
     suffix = "_demand" if use_demand else ""
-    out_path = os.path.join(MODELS_DIR, f"classifier_{energy_type}{suffix}.joblib")
-    joblib.dump({"model": model, "features": features}, out_path)
+    name = f"classifier_{energy_type}{suffix}"
+    out_path = save_artifact(
+        name, model, features,
+        train_period=[str(train["dt"].min()), str(train["dt"].max())],
+        test_period=[TEST_START, TEST_END],
+        label_coverage=list(CURTAILMENT_COVERAGE[energy_type]),
+        input_generation="actual",  # 학습 입력은 실측 발전량 — 서비스 경로 성능은 evaluate_pipeline 참고
+        test_report=report,
+    )
 
-    metrics = {"energy_type": energy_type, "use_demand": use_demand, "auc": round(float(auc), 4),
-               "top5_capture": round(top5, 4), "n_train": len(train), "n_test": len(test),
-               "n_pos_test": int(y_true.sum())}
-    print(f"[classifier:{energy_type}{suffix}] AUC={metrics['auc']} top5={metrics['top5_capture']} "
-          f"(test n={metrics['n_test']}, pos={metrics['n_pos_test']}) -> {out_path}")
+    metrics = {"energy_type": energy_type, "use_demand": use_demand,
+               "n_train": len(train), "n_pos_train": int(train["is_curtailed"].sum()), **report}
+    print(f"[{name}] AUC={report['auc']} PR-AUC={report['pr_auc']} "
+          f"top5={report['top5_capture']}(최대 {report['top5_ceiling']}) prec@5%={report['top5_precision']} "
+          f"(test n={report['n']}, pos={report['n_pos']}, 양성비율={report['pos_rate']}) -> {out_path}")
+    warn = saturation_warning(report)
+    if warn:
+        print("  ⚠ " + warn)
     return metrics
 
 

@@ -1,7 +1,12 @@
+# 모델(.joblib)은 학습한 scikit-learn 버전과 같은 버전으로 로드해야 안전하다.
+# 기존 모델 아티팩트는 scikit-learn 1.7.2로 학습됐다. 재학습 후에는
+#   pip freeze | grep -iE "scikit-learn|numpy|pandas|joblib"
+# 결과로 아래 버전을 정확히 맞춰 고정하는 것을 권장한다.
+scikit-learn==1.7.2
+numpy>=1.26,<3
+pandas>=2.2,<3
+joblib>=1.3,<2
 fastapi>=0.110
 uvicorn[standard]>=0.29
-pydantic>=2.6
-scikit-learn>=1.4
-pandas>=2.2
-numpy>=1.26
-joblib>=1.3
+pydantic>=2.6,<3
+httpx>=0.27  # smoke_test.py(TestClient) 실행용

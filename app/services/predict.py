@@ -1,19 +1,26 @@
 """
 추론 서비스 — 학습된 컨버터/분류기/회귀모델을 로드해 실제 예측을 수행한다.
 app/training/*.py 로 학습된 .joblib 아티팩트를 그대로 사용한다.
+
+[수정 사항]
+- 누락된 기상값을 0으로 바꾸던 처리 제거 (schemas.py에서 MISSING_REQUIRED_FIELD로 거부)
+- 시간/월 피처를 학습과 동일한 기준(각 시간 구간의 '끝 시각' dt)으로 계산
+  -> 24시는 다음날 00:00이므로 월말 24시의 month는 다음 달로 계산된다(학습 데이터와 일치)
+- 24시간을 한 번에 DataFrame으로 추론 (행마다 DataFrame 생성하던 방식 제거)
+- 실제 사용된 분류모델을 응답의 model_used로 반환
+- 아티팩트 로드 시 scikit-learn 버전 불일치 경고 (app/model_io.py)
 """
 from __future__ import annotations
 
-import os
+from datetime import datetime, timedelta
 from functools import lru_cache
 
-import joblib
 import numpy as np
 import pandas as pd
 
-from app.schemas import EnergyType, PredictRequest, HourlyPrediction, PredictResponse
-
-MODELS_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "models")
+from app.data_prep import add_time_features
+from app.model_io import load_artifact
+from app.schemas import EnergyType, HourlyPrediction, PredictRequest, PredictResponse
 
 SOLAR_NOTE = (
     "태양광은 전력거래소가 출력제어 제어량(MWh)을 공식적으로 산정하지 않아(계획서 07장) "
@@ -23,87 +30,62 @@ SOLAR_NOTE = (
 
 @lru_cache(maxsize=None)
 def _load(name: str) -> dict:
-    path = os.path.join(MODELS_DIR, f"{name}.joblib")
-    if not os.path.exists(path):
-        raise FileNotFoundError(
-            f"{path} 없음 — 먼저 `python -m app.training.train_converter` 등으로 학습을 실행하세요"
-        )
-    return joblib.load(path)
+    return load_artifact(name)
 
 
-def _time_features(hour_1_24: int, month: int) -> dict:
-    hour0 = 0 if hour_1_24 == 24 else hour_1_24
-    return {
-        "hour_sin": np.sin(2 * np.pi * hour0 / 24),
-        "hour_cos": np.cos(2 * np.pi * hour0 / 24),
-        "month_sin": np.sin(2 * np.pi * month / 12),
-        "month_cos": np.cos(2 * np.pi * month / 12),
-    }
+def _optional(name: str) -> dict | None:
+    try:
+        return _load(name)
+    except FileNotFoundError:
+        return None
 
 
 def predict(req: PredictRequest) -> PredictResponse:
     energy_type: EnergyType = req.energy_type
     converter = _load(f"converter_{energy_type}")
-    month = req.target_date.month
 
-    weather_by_hour = {w.hour: w for w in req.weather}
+    # 학습 데이터와 같은 기준: h시 = target_date 00:00 + h시간 (24시 -> 다음날 00:00)
+    base = datetime.combine(req.target_date, datetime.min.time())
+    weather = sorted(req.weather, key=lambda w: w.hour)
+    df = pd.DataFrame([w.model_dump() for w in weather])
+    df["dt"] = [base + timedelta(hours=w.hour) for w in weather]
+    df = add_time_features(df)
 
     # ---- ②단계: 날씨 -> 발전량 예측치 ----
-    gen_forecast: dict[int, float] = {}
-    for h in range(1, 25):
-        w = weather_by_hour[h]
-        tf = _time_features(h, month)
-        if energy_type == "solar":
-            values = {"solar_rad": w.solar_rad or 0.0, "temp": w.temp or 0.0, "cloud": w.cloud or 0.0, **tf}
-        else:
-            values = {"wind_speed": w.wind_speed or 0.0, **tf}
-        row = pd.DataFrame([values])[converter["features"]]
-        pred = converter["model"].predict(row)[0]
-        gen_forecast[h] = max(0.0, float(pred))
+    df["generation_mwh"] = np.clip(converter["model"].predict(df[converter["features"]]), 0, None)
 
     # ---- ③단계: 발전량 -> 출력제어 확률 ----
     use_demand = energy_type == "wind" and req.demand_forecast_mw is not None
     clf_name = "classifier_wind_demand" if use_demand else f"classifier_{energy_type}"
     classifier = _load(clf_name)
-
-    demand_by_hour = {}
     if use_demand:
-        demand_by_hour = {h: v for h, v in zip(range(1, 25), req.demand_forecast_mw)}
+        df["demand_mw"] = req.demand_forecast_mw
+    proba = classifier["model"].predict_proba(df[classifier["features"]])[:, 1]
 
     # ---- 풍력 전용: ④ 계산에 쓰이는 제어량(MWh) 회귀 ----
-    regressor = None
-    if energy_type == "wind":
-        try:
-            regressor = _load("curtailment_regressor_wind")
-        except FileNotFoundError:
-            regressor = None
+    # 회귀모델은 수요 피처가 필수라 수요예측이 없으면 제어량을 제공하지 않는다
+    expected = [None] * 24
+    if energy_type == "wind" and use_demand:
+        regressor = _optional("curtailment_regressor_wind")
+        if regressor is not None:
+            expected = np.clip(regressor["model"].predict(df[regressor["features"]]), 0, None).tolist()
 
-    hourly: list[HourlyPrediction] = []
-    for h in range(1, 25):
-        tf = _time_features(h, month)
-        feat_row = {
-            "generation_mwh": gen_forecast[h],
-            "hour_sin": tf["hour_sin"], "hour_cos": tf["hour_cos"],
-            "month_sin": tf["month_sin"], "month_cos": tf["month_cos"],
-        }
-        if use_demand:
-            feat_row["demand_mw"] = demand_by_hour[h]
+    hourly = [
+        HourlyPrediction(
+            hour=int(h),
+            generation_forecast_mwh=round(float(g), 2),
+            curtailment_probability=round(float(p), 4),
+            expected_curtailment_mwh=round(float(e), 2) if e is not None else None,
+        )
+        for h, g, p, e in zip(df["hour"], df["generation_mwh"], proba, expected)
+    ]
 
-        x = pd.DataFrame([feat_row])[classifier["features"]]
-        proba = float(classifier["model"].predict_proba(x)[0][1])
-
-        expected_mwh = None
-        if energy_type == "wind" and regressor is not None:
-            xr = pd.DataFrame([feat_row])[regressor["features"]]
-            expected_mwh = max(0.0, float(regressor["model"].predict(xr)[0]))
-
-        hourly.append(HourlyPrediction(
-            hour=h, generation_forecast_mwh=round(gen_forecast[h], 2),
-            curtailment_probability=round(proba, 4),
-            expected_curtailment_mwh=round(expected_mwh, 2) if expected_mwh is not None else None,
-        ))
+    note = SOLAR_NOTE if energy_type == "solar" else None
+    if energy_type == "wind" and not use_demand:
+        note = ("demand_forecast_mw가 없어 수요 미포함 모델(classifier_wind)을 사용했고, "
+                "제어량 회귀모델은 수요 피처가 필요해 expected_curtailment_mwh를 제공하지 않습니다.")
 
     return PredictResponse(
         energy_type=energy_type, region=req.region, target_date=req.target_date,
-        hourly=hourly, note=(SOLAR_NOTE if energy_type == "solar" else None),
+        hourly=hourly, model_used=clf_name, note=note,
     )

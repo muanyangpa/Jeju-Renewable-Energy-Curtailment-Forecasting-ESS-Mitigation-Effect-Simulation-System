@@ -18,7 +18,18 @@ from dataclasses import dataclass
 import numpy as np
 import pandas as pd
 
-DATA_DIR = "/sessions/gracious-dreamy-noether/mnt/uploads"
+# 원본 공공데이터 CSV 폴더. 환경변수 DATA_DIR로 지정하거나, 기본값(프로젝트 루트/data/raw)을 사용한다.
+# (수정 전: 다른 실행환경의 절대경로가 하드코딩돼 있어 로컬에서 재학습이 불가능했음)
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DATA_DIR = os.environ.get("DATA_DIR", os.path.join(_PROJECT_ROOT, "data", "raw"))
+
+# 출력제어 이력 파일이 커버하는 라벨 유효 구간 [start, end).
+# - start: 출력제어 제도가 실제로 시작된 시점(그 이전은 '제어 없음'이 아니라 '라벨 의미 없음')
+# - end: 발전량 실적이 2023.12까지만 있으므로 2024-01-01에서 자른다
+CURTAILMENT_COVERAGE = {
+    "wind": ("2021-01-01", "2024-01-01"),
+    "solar": ("2021-10-01", "2024-01-01"),
+}
 
 
 def _read_csv_any_encoding(path: str, **kwargs) -> pd.DataFrame:
@@ -32,20 +43,27 @@ def _read_csv_any_encoding(path: str, **kwargs) -> pd.DataFrame:
 
 def _find(pattern_substr: str) -> str:
     """uploads 폴더에서 파일명에 pattern_substr이 포함된 첫 파일 경로를 반환."""
-    for f in os.listdir(DATA_DIR):
+    for f in sorted(os.listdir(DATA_DIR)):
         if pattern_substr in f:
             return os.path.join(DATA_DIR, f)
     raise FileNotFoundError(f"no file containing '{pattern_substr}' in {DATA_DIR}")
 
 
 def _melt_hourly(df: pd.DataFrame, date_col: str, value_name: str) -> pd.DataFrame:
-    """'1시'~'24시' 와이드 포맷 -> (dt, value) 롱 포맷. 24시는 다음날 0시로 취급."""
+    """'1시'~'24시' 와이드 포맷 -> (dt, value) 롱 포맷. 24시는 '다음날 00:00'으로 취급.
+
+    dt는 해당 1시간 구간의 '끝 시각'이다(예: 1시 = 00:00~01:00 구간 -> 01:00).
+    ASOS의 일시(정시 관측, 일사량은 직전 1시간 누적)와 같은 기준이라 그대로 merge할 수 있다.
+
+    [버그 수정] 이전 코드는 24를 0으로 바꾼 뒤 '같은 날' 00:00에 붙여서, D일 24시 값이 D일 00:00
+    (= 실제로는 D-1일 24시 자리)에 들어가 하루 어긋났다. 24시간 timedelta를 그대로 더하면
+    자연스럽게 다음날 00:00이 된다.
+    """
     df = df.copy()
     df[date_col] = pd.to_datetime(df[date_col])
     hour_cols = [c for c in df.columns if str(c).endswith("시")]
     long = df.melt(id_vars=date_col, value_vars=hour_cols, var_name="hour", value_name=value_name)
-    long["hour"] = long["hour"].str.replace("시", "", regex=False).astype(int)
-    long["hour"] = long["hour"].replace(24, 0)
+    long["hour"] = long["hour"].astype(str).str.replace("시", "", regex=False).astype(int)
     long["dt"] = long[date_col] + pd.to_timedelta(long["hour"], unit="h")
     return long[["dt", value_name]]
 
@@ -80,7 +98,9 @@ def load_curtailment(energy_type: str) -> pd.DataFrame:
         long["is_curtailed"] = long["curtailment_mwh"] > 0
     else:
         # 태양광 파일이 여러 개 있을 수 있어 "월별" 같은 다른 파일은 제외
-        candidates = [f for f in os.listdir(DATA_DIR) if "태양광 출력제어횟수" in f and "월별" not in f]
+        candidates = sorted(f for f in os.listdir(DATA_DIR) if "태양광 출력제어횟수" in f and "월별" not in f)
+        if not candidates:
+            raise FileNotFoundError(f"no file containing '태양광 출력제어횟수' in {DATA_DIR}")
         path = os.path.join(DATA_DIR, candidates[0])
         df = _read_csv_any_encoding(path)
         long = _melt_hourly(df, "일자", "flag")
@@ -98,7 +118,11 @@ def load_curtailment(energy_type: str) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 
 def load_demand_actual() -> pd.DataFrame:
-    files = [f for f in os.listdir(DATA_DIR) if f.startswith("한국전력거래소_시간별 제주전력수요")]
+    # 파일명 정렬: 스냅샷이 겹치는 시간은 keep="last"로 처리하므로, 정렬하지 않으면
+    # os.listdir 순서(환경마다 다름)에 따라 결과가 달라진다.
+    files = sorted(f for f in os.listdir(DATA_DIR) if f.startswith("한국전력거래소_시간별 제주전력수요"))
+    if not files:
+        raise FileNotFoundError(f"no demand files in {DATA_DIR}")
     frames = []
     for f in files:
         path = os.path.join(DATA_DIR, f)
@@ -153,6 +177,34 @@ def load_asos_multi(stations: tuple[str, ...] = ("184", "185", "188")) -> pd.Dat
         "solar_rad": combined.xs("solar_rad", axis=1, level=1).mean(axis=1, skipna=True),
     }).dropna(subset=["wind_speed"]).reset_index()
     return avg.sort_values("dt").reset_index(drop=True)
+
+
+# ---------------------------------------------------------------------------
+# 학습용 라벨 프레임 (전체 달력 기준)
+# ---------------------------------------------------------------------------
+
+def build_labeled_hourly(energy_type: str) -> pd.DataFrame:
+    """발전량 실적(모든 시간)을 기준 달력으로 삼아 출력제어 라벨을 붙인다.
+
+    [버그 수정] 출력제어 이력 파일에는 '제어가 발생한 날'만 들어 있다. 이전 코드는 이 파일과
+    inner join을 해서 제어가 없었던 날(음성 사례 대부분)이 통째로 빠졌고, 그 결과
+      - 모델이 '오늘 제어가 있을까'가 아니라 '제어가 있는 날 몇 시에 있을까'를 학습했고
+      - 테스트 양성 비율이 약 20%로 부풀어 상위5%포착률이 수학적 상한(약 0.25)에 막혔다.
+    여기서는 left join 후 이력에 없는 시간은 '제어 없음'(제어량 0)으로 채우고,
+    라벨이 의미 있는 구간(CURTAILMENT_COVERAGE)만 남긴다.
+
+    반환: DataFrame[dt, generation_mwh, is_curtailed(int 0/1), curtailment_mwh]
+          (태양광 curtailment_mwh는 공식 미산정이므로 NaN 유지)
+    """
+    gen = load_generation_actual(energy_type)
+    curt = load_curtailment(energy_type)
+    df = gen.merge(curt, on="dt", how="left")
+    df["is_curtailed"] = df["is_curtailed"].fillna(False).astype(bool).astype(int)
+    if energy_type == "wind":
+        df["curtailment_mwh"] = df["curtailment_mwh"].fillna(0.0)
+    start, end = CURTAILMENT_COVERAGE[energy_type]
+    df = df[(df["dt"] >= start) & (df["dt"] < end)]
+    return df.sort_values("dt").reset_index(drop=True)
 
 
 # ---------------------------------------------------------------------------

@@ -4,21 +4,21 @@
 계획서 02장/05장에 정의된 ②단계 모델. H장에서 확인된 교훈(시간 피처 없으면 상관계수 0.54,
 추가하면 0.90 이상)을 그대로 반영해 hour_sin/cos, month_sin/cos를 입력에 포함한다.
 
+[수정 사항] data_prep의 24시 정렬 버그 수정이 반영되므로 재학습 필요. 아티팩트에 메타데이터 저장.
+
 실행: python -m app.training.train_converter
 """
 from __future__ import annotations
 
 import os
 
-import joblib
 import numpy as np
 import pandas as pd
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.metrics import mean_absolute_error
 
 from app.data_prep import add_time_features, load_asos, load_asos_multi, load_generation_actual
-
-MODELS_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "models")
+from app.model_io import MODELS_DIR, save_artifact
 
 SOLAR_FEATURES = ["solar_rad", "temp", "cloud", "hour_sin", "hour_cos", "month_sin", "month_cos"]
 WIND_FEATURES = ["wind_speed", "hour_sin", "hour_cos", "month_sin", "month_cos"]
@@ -57,9 +57,13 @@ def train_one(energy_type: str) -> dict:
     corr = np.corrcoef(test["generation_mwh"], pred)[0, 1]
     nmae = _nmae(test["generation_mwh"].to_numpy(), pred)
 
-    os.makedirs(MODELS_DIR, exist_ok=True)
-    out_path = os.path.join(MODELS_DIR, f"converter_{energy_type}.joblib")
-    joblib.dump({"model": model, "features": features, "station": station}, out_path)
+    out_path = save_artifact(
+        f"converter_{energy_type}", model, features,
+        station=station,
+        train_period=[str(train["dt"].min()), str(train["dt"].max())],
+        test_period=["2023-01-01", str(test["dt"].max())],
+        test_corr=round(float(corr), 4), test_nmae_pct=round(float(nmae), 2),
+    )
 
     metrics = {"energy_type": energy_type, "station": station, "corr": round(float(corr), 4), "nmae_pct": round(float(nmae), 2),
                "n_train": len(train), "n_test": len(test)}
