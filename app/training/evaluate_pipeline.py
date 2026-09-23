@@ -36,7 +36,8 @@ def _weather(energy_type: str) -> pd.DataFrame:
 
 def evaluate(energy_type: str, use_demand: bool) -> list[dict]:
     converter = load_artifact(f"converter_{energy_type}")
-    clf_name = f"classifier_{energy_type}" + ("_demand" if use_demand else "")
+    # /predict가 서빙하는 것은 보정 모델이므로 서비스 경로 평가도 보정 모델로 한다.
+    clf_name = f"classifier_{energy_type}" + ("_demand" if use_demand else "") + "_calibrated"
     classifier = load_artifact(clf_name)
 
     labeled = build_labeled_hourly(energy_type)

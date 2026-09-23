@@ -83,9 +83,20 @@ class PredictRequest(BaseModel):
 class HourlyPrediction(BaseModel):
     hour: int
     generation_forecast_mwh: float
-    curtailment_probability: float
+    curtailment_probability: float = Field(
+        ..., description="출력제어 발생 확률 0~1. 산출 모델은 model_used 참고 — 풍력+수요예측이면 "
+                         "isotonic 보정된 확률이다"
+    )
     expected_curtailment_mwh: Optional[float] = Field(
-        None, description="풍력만 값 존재. 태양광은 07장 사유로 null 고정"
+        None,
+        description=(
+            "제어량 기댓값 = curtailment_probability x E[제어량|제어 발생] (2단계 모델). "
+            "같은 확률을 쓰므로 expected_curtailment_mwh / curtailment_probability = 조건부 제어량이 된다. "
+            "풍력 + demand_forecast_mw가 있을 때만 값이 존재하고, 태양광은 07장 사유로 null 고정. "
+            "⚠ 이 값은 '기댓값'이라 개별 시간의 제어량 크기가 아니다 — /ess/simulate의 "
+            "hourly_curtailment_mwh로 넘기지 말 것. 2023년 검증에서 ESS 흡수율이 "
+            "실측 36.8% 대비 87.3%로 과대평가됐다(README '알려진 한계')."
+        ),
     )
 
 
@@ -95,8 +106,11 @@ class PredictResponse(BaseModel):
     target_date: date
     hourly: list[HourlyPrediction]
     model_used: str = Field(
-        ..., description="실제 사용된 분류모델 이름. 풍력에서 demand_forecast_mw를 생략하면 "
-                         "'classifier_wind'(수요 미포함)로 자동 전환되므로 이 값으로 확인"
+        ..., description="curtailment_probability를 산출한 모델 이름. "
+                         "풍력+demand_forecast_mw: 'curtailment_stage1_wind'(isotonic 보정, 2단계 1단계). "
+                         "풍력에서 demand_forecast_mw를 생략하면 'classifier_wind'(수요 미포함), "
+                         "태양광은 'classifier_solar'. 2단계 아티팩트가 없으면 "
+                         "'classifier_wind_demand'로 대체되고 expected_curtailment_mwh는 null이 된다"
     )
     note: Optional[str] = Field(
         None, description="태양광 응답에는 expected_curtailment_mwh가 null인 이유를 항상 포함"

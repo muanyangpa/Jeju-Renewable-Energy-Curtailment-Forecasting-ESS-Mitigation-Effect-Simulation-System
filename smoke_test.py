@@ -38,20 +38,26 @@ check("확률 0~1", all(0 <= h["curtailment_probability"] <= 1 for h in b["hourl
 check("발전량 >= 0", all(h["generation_forecast_mwh"] >= 0 for h in b["hourly"]))
 check("태양광 제어량 null", all(h["expected_curtailment_mwh"] is None for h in b["hourly"]))
 check("태양광 note 존재", bool(b["note"]))
-check("model_used", b["model_used"] == "classifier_solar")
+check("model_used=보정 태양광", b["model_used"] == "classifier_solar_calibrated")
 
 print("== /predict wind (수요 포함) ==")
 r = post({"energy_type": "wind", "region": "한림읍", "target_date": "2023-06-15", "weather": weather24,
           "demand_forecast_mw": [600.0] * 24})
 check("200", r.status_code == 200, r.text)
 b = r.json()
-check("model_used=수요모델", b["model_used"] == "classifier_wind_demand")
+check("model_used=보정 수요모델", b["model_used"] == "classifier_wind_demand_calibrated")
 check("풍력 제어량 값 존재", all(h["expected_curtailment_mwh"] is not None for h in b["hourly"]))
+# 확률 통일 검증: expected = curtailment_probability x E[제어량|제어] 이므로
+# expected / probability 가 물리적으로 말이 되는 조건부 제어량(0~500MWh)이어야 한다.
+implied = [h["expected_curtailment_mwh"] / h["curtailment_probability"]
+           for h in b["hourly"] if h["curtailment_probability"] > 0.01]
+check("expected = prob x 조건부 관계 성립", bool(implied) and all(0 <= v <= 500 for v in implied),
+      f"implied 조건부 제어량 범위: {min(implied):.1f}~{max(implied):.1f}" if implied else "확률이 모두 0")
 
 print("== /predict wind (수요 생략 -> 자동 전환, 수정 전에는 500 에러) ==")
 r = post({"energy_type": "wind", "region": "한림읍", "target_date": "2023-06-15", "weather": weather24})
 check("200", r.status_code == 200, r.text)
-check("model_used=수요 미포함", r.json()["model_used"] == "classifier_wind")
+check("model_used=보정 수요 미포함", r.json()["model_used"] == "classifier_wind_calibrated")
 
 print("== 에러코드 ==")
 r = post({"energy_type": "solar", "region": "남원읍", "target_date": "2023-06-15", "weather": weather24[:23]})
