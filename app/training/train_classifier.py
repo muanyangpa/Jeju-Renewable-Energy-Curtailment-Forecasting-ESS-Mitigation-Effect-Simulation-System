@@ -38,6 +38,7 @@ from app.data_prep import (CURTAILMENT_COVERAGE, add_normalized_features, add_ti
                            build_labeled_hourly, latest_capacity_proxy, load_demand_actual,
                            load_generation_actual)
 from app.metrics import classification_report, saturation_warning
+from app.training.train_converter import GEN_SOURCE
 from app.model_io import MODELS_DIR, save_artifact
 
 # [2026-09-25] 발전량 절대값(MWh) -> 정규화 피처로 교체.
@@ -98,7 +99,10 @@ def train_one(energy_type: str, use_demand: bool) -> list[dict]:
     calib = df[(df["dt"] >= CALIB_START) & (df["dt"] < CALIB_END)]
     test = df[(df["dt"] >= TEST_START) & (df["dt"] < TEST_END)]
 
-    proxy_now = latest_capacity_proxy(load_generation_actual(energy_type))
+    # 서빙 대리지표는 '컨버터가 내보내는 값과 같은 출처'로 계산해야 한다.
+    # capacity_factor = 컨버터출력 / 대리지표 이므로, 둘의 모집단이 다르면 비율이 왜곡된다.
+    proxy_now = latest_capacity_proxy(
+        load_generation_actual(energy_type, source=GEN_SOURCE[energy_type]))
 
     base = make_model()
     base.fit(train[features], train["is_curtailed"])

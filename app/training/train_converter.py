@@ -33,6 +33,16 @@ WIND_FEATURES = ["wind_speed", "hour_sin", "hour_cos", "month_sin", "month_cos"]
 #           외삽이 아니라 관측지점과 풍력단지의 위치 불일치이고, 3지점 평균으로 이미 대응했다.
 NORMALIZED_TARGET = {"solar": True, "wind": False}
 
+# 테스트 구간도 발전원별로 다르다 — 쓸 수 있는 데이터 범위가 다르기 때문이다.
+#   태양광: 2026-01까지 확보 -> 최근 1년(2025)을 테스트로 사용
+#   풍력  : 제도 전환으로 2024-06부터 집계가 끊겨 2023년 테스트를 유지
+TEST_SPLIT = {"solar": ("2025-01-01", "2026-01-01"), "wind": ("2023-01-01", "2024-01-01")}
+
+# 발전원별 데이터 출처 — 두 출처는 모집단이 다르므로 섞지 않는다(data_prep 주석 참고).
+#   태양광: 신규(전력시장 거래량)만. 2024 학습 / 2025 테스트. 혼합보다 정확했다(22.74% vs 25.09%)
+#   풍력  : 기존 + 신규(2024-05까지). 신규 단독으로는 표본이 부족하다.
+GEN_SOURCE = {"solar": "market", "wind": "all"}
+
 
 def _nmae(y_true: np.ndarray, y_pred: np.ndarray) -> float:
     denom = np.mean(np.abs(y_true))
@@ -51,7 +61,7 @@ def train_one(energy_type: str) -> dict:
         weather = load_asos("184")  # 태양광은 일사량 기준 지점 하나로 충분(H장 검증)
         station = "184"
     weather = add_time_features(weather)
-    gen = load_generation_actual(energy_type)
+    gen = load_generation_actual(energy_type, source=GEN_SOURCE[energy_type])
 
     df = weather.merge(gen, on="dt", how="inner")
     features = SOLAR_FEATURES if energy_type == "solar" else WIND_FEATURES
@@ -66,9 +76,10 @@ def train_one(energy_type: str) -> dict:
         df["target"] = df["generation_mwh"]
     df = df.dropna(subset=features + ["target", "generation_mwh"])
 
-    # 리키지-프리: 2023년을 테스트로, 그 이전을 학습으로 (계획서 전체와 동일한 시간분할 원칙)
-    train = df[df["dt"] < "2023-01-01"]
-    test = df[df["dt"] >= "2023-01-01"]
+    # 리키지-프리 시간분할: 테스트 구간 이전만 학습에 사용
+    t0, t1 = TEST_SPLIT[energy_type]
+    train = df[df["dt"] < t0]
+    test = df[(df["dt"] >= t0) & (df["dt"] < t1)]
 
     model = RandomForestRegressor(n_estimators=300, max_depth=12, random_state=42, n_jobs=-1)
     model.fit(train[features], train["target"])
@@ -91,11 +102,11 @@ def train_one(energy_type: str) -> dict:
         capacity_proxy_mwh=serve_proxy,      # 서빙에서 곱하는 상수 (정규화 모델만)
         eval_capacity_proxy_mwh=eval_proxy,  # 아래 지표를 낼 때 쓴 값
         train_period=[str(train["dt"].min()), str(train["dt"].max())],
-        test_period=["2023-01-01", str(test["dt"].max())],
+        test_period=[t0, t1],
         test_corr=round(float(corr), 4), test_nmae_pct=round(float(nmae), 2),
     )
 
-    metrics = {"energy_type": energy_type, "station": station,
+    metrics = {"energy_type": energy_type, "station": station, "test_period": f"{t0}~{t1}",
                "target": "capacity_factor" if normalized else "generation_mwh",
                "corr": round(float(corr), 4), "nmae_pct": round(float(nmae), 2),
                "n_train": len(train), "n_test": len(test)}

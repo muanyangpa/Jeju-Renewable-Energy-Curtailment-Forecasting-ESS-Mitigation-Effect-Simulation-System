@@ -74,7 +74,22 @@ def _melt_hourly(df: pd.DataFrame, date_col: str, value_name: str) -> pd.DataFra
 
 # 롱 포맷 지역별 데이터셋(한국전력거래소_지역별 시간별 태양광 및 풍력 발전량)의 필수 컬럼.
 # 기존 "제주지역 ... 한시간단위실적"은 1시~24시 와이드 포맷이고, 이쪽은 행 단위다.
-_LONG_GEN_COLS = ("거래일", "거래시간", "지역", "연료원")
+# 롱 포맷(지역별 시간별 발전량) 배포본은 연도마다 스키마가 미묘하게 다르다.
+#   날짜 컬럼 : 2024년판 '거래일자' / 2025년판 '거래일'
+#   지역 표기 : 2024년판 태양광 '제주도' · 풍력 '제주' / 2025년판 둘 다 '제주도'
+# 완전일치로 거르면 한 해가 통째로 조용히 빠지므로, 날짜 컬럼은 후보 목록에서 찾고
+# 지역은 '제주' 부분일치로 받는다.
+_LONG_GEN_DATE_COLS = ("거래일", "거래일자")
+_LONG_GEN_COLS = ("거래시간", "지역", "연료원")
+
+# [중요] 제주 풍력은 2024-06-01 재생에너지 입찰제도 본격 운영과 함께 이 데이터셋에서
+# 사실상 사라진다 — 발전을 안 한 게 아니라 거래가 다른 경로로 정산되기 때문으로 보인다.
+#   월 합계: 2024-05 42,657MWh -> 2024-06 5,421 -> 2025-03 이후 1,000~2,800 (정상치의 4%)
+#   풍속 상관: 2023년 0.786 -> 2024년 0.624 -> 2025년 0.540
+#   평균 발전: 58MWh -> 42 -> 8.6
+# 이 구간을 그대로 학습에 넣으면 컨버터가 '바람이 불어도 발전하지 않는다'를 학습한다.
+# 출력제어 이력이 2024-05에서 끊긴 것과 같은 원인이다(README '제도 전환' 참고).
+GENERATION_VALID_END = {"wind": "2024-06-01", "solar": None}
 
 
 def _read_generation_wide(energy_type: str) -> pd.DataFrame:
@@ -118,7 +133,8 @@ def _read_generation_long(energy_type: str) -> pd.DataFrame:
         except Exception:
             continue
         cols = {str(c).strip() for c in df.columns}
-        if not set(_LONG_GEN_COLS).issubset(cols):
+        date_col = next((c for c in _LONG_GEN_DATE_COLS if c in cols), None)
+        if date_col is None or not set(_LONG_GEN_COLS).issubset(cols):
             continue
         df = _read_csv_any_encoding(os.path.join(DATA_DIR, f))
         df.columns = [str(c).strip() for c in df.columns]
@@ -132,7 +148,7 @@ def _read_generation_long(energy_type: str) -> pd.DataFrame:
         hours = pd.to_numeric(sub["거래시간"], errors="coerce")
         sub = sub[hours.notna()]
         hours, note = _hour_to_end_of_hour(hours.dropna().astype(int))
-        sub["dt"] = pd.to_datetime(sub["거래일"], errors="coerce") + pd.to_timedelta(hours, unit="h")
+        sub["dt"] = pd.to_datetime(sub[date_col], errors="coerce") + pd.to_timedelta(hours, unit="h")
         sub["generation_mwh"] = pd.to_numeric(sub[val_col], errors="coerce")
         sub = sub.dropna(subset=["dt", "generation_mwh"])
         if not sub.empty:
@@ -141,16 +157,45 @@ def _read_generation_long(energy_type: str) -> pd.DataFrame:
             frames.append(sub[["dt", "generation_mwh"]])
     if not frames:
         return pd.DataFrame(columns=["dt", "generation_mwh"])
-    return pd.concat(frames).groupby("dt", as_index=False)["generation_mwh"].sum()
+    out = pd.concat(frames).groupby("dt", as_index=False)["generation_mwh"].sum()
+    end = GENERATION_VALID_END.get(energy_type)
+    if end:
+        dropped = int((out["dt"] >= end).sum())
+        if dropped:
+            print(f"  [발전량:{energy_type}] 제도 전환({end}) 이후 {dropped}시간 제외 "
+                  f"— 입찰시장 이전으로 집계가 끊긴 구간")
+        out = out[out["dt"] < end]
+    return out
 
 
-def load_generation_actual(energy_type: str) -> pd.DataFrame:
+def load_generation_actual(energy_type: str, source: str = "all") -> pd.DataFrame:
     """energy_type: 'solar' | 'wind' -> DataFrame[dt, generation_mwh]
 
-    기존 와이드 파일을 기준으로 삼고, 롱 포맷 지역별 파일은 '기존에 없는 시각'만 덧붙인다.
-    겹치는 구간에서 기존 값을 유지하는 이유는 지금까지의 검증 결과를 재현 가능하게 두기 위함이다.
+    source:
+      "all"    기존 + 신규 (기본). 라벨 구간(~2024-01)이 전부 기존 출처 안에 있어
+               분류기·라벨 작업에는 이 값을 쓴다.
+      "legacy" 기존 '제주지역 한시간단위실적'만
+      "market" 신규 '지역별 시간별 전력거래량'만
+
+    [두 출처는 모집단이 다르다 — 섞으면 안 되는 경우가 있다]
+    신규 데이터셋은 "전력시장에 참여하는 발전기의 전력거래량"으로, 전기사업법 시행령
+    제19조 1항 2호에 따른 한전 직접거래(PPA)·자가용을 **포함하지 않는다**. 또 송전단 기준이고
+    ESS 충방전량이 섞여 있다. 그 결과 태양광 연간 총합이 2023년 487.2GWh(기존) ->
+    2024년 448.5GWh(신규)로 설비가 늘었는데도 8% 줄어든다. 일사량 1MJ/m2당 발전량도
+    2021->2023에 +17.5%, +24.6%로 늘다가 출처가 바뀌는 2024년 -2.0%, 2025년 -7.0%로 꺾인다.
+
+    겹치는 구간이 없어 보정계수를 직접 구할 수 없고, 입찰제도 하의 제어 증가와도 섞여 있다.
+    그래서 컨버터는 한 출처만 쓴다 — 실측 비교에서 신규 단독(NMAE 22.74%)이 혼합(25.09%)보다
+    학습 데이터가 1/5인데도 더 정확했다.
+
+    capacity_factor는 비율이라 출처 간 배율 차이가 분자·분모에서 상쇄되므로, 컨버터와
+    서빙 대리지표가 같은 출처를 쓰기만 하면 분류기의 학습(기존 출처) 관계와 호환된다.
     """
+    if source == "market":
+        return _read_generation_long(energy_type).sort_values("dt").reset_index(drop=True)
     wide = _read_generation_wide(energy_type)
+    if source == "legacy":
+        return wide.sort_values("dt").drop_duplicates(subset="dt").reset_index(drop=True)
     extra = _read_generation_long(energy_type)
     if not extra.empty:
         new_only = extra[~extra["dt"].isin(set(wide["dt"]))]
@@ -277,13 +322,40 @@ def load_demand_actual() -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 
 def load_asos(station: str = "184") -> pd.DataFrame:
-    """station별 2021~2023 파일을 합쳐 DataFrame[dt, temp, wind_speed, humidity, cloud, solar_rad] 반환."""
-    files = sorted(f for f in os.listdir(DATA_DIR) if f.startswith(f"SURFACE_ASOS_{station}_HR_"))
+    """station별 파일을 합쳐 DataFrame[dt, temp, wind_speed, humidity, cloud, solar_rad] 반환.
+
+    두 가지 파일 형식을 모두 읽는다.
+      - SURFACE_ASOS_{지점}_HR_*.csv : 지점 하나당 파일 하나 (기존)
+      - 그 밖의 CSV 중 '지점'과 '일시' 컬럼을 가진 파일 : 여러 지점이 한 파일에 든 형식
+        (기상자료개방포털에서 지점을 여러 개 골라 받으면 OBS_ASOS_TIM_*.csv로 나온다)
+    파일명 규칙에만 의존하면 포털 다운로드 이름이 바뀔 때마다 조용히 실패하므로,
+    컬럼 구조로도 판별한다.
+    """
     frames = []
-    for f in files:
+    for f in sorted(os.listdir(DATA_DIR)):
+        if not f.lower().endswith(".csv"):
+            continue
+        if f.startswith(f"SURFACE_ASOS_{station}_HR_"):
+            frames.append(_read_csv_any_encoding(os.path.join(DATA_DIR, f)))
+            continue
+        try:
+            head = _read_csv_any_encoding(os.path.join(DATA_DIR, f), nrows=5)
+        except Exception:
+            continue
+        cols = {str(c).strip() for c in head.columns}
+        if not {"지점", "일시", "기온(°C)"}.issubset(cols):
+            continue
         df = _read_csv_any_encoding(os.path.join(DATA_DIR, f))
-        frames.append(df)
-    raw = pd.concat(frames).drop_duplicates(subset="일시")
+        df.columns = [str(c).strip() for c in df.columns]
+        sub = df[pd.to_numeric(df["지점"], errors="coerce") == int(station)]
+        if not sub.empty:
+            frames.append(sub)
+    if not frames:
+        raise FileNotFoundError(f"지점 {station}의 ASOS 파일을 {DATA_DIR}에서 찾지 못했습니다")
+
+    raw = pd.concat(frames)
+    raw.columns = [str(c).strip() for c in raw.columns]
+    raw = raw.drop_duplicates(subset="일시")
     out = pd.DataFrame({
         "dt": pd.to_datetime(raw["일시"]),
         "temp": pd.to_numeric(raw["기온(°C)"], errors="coerce"),
