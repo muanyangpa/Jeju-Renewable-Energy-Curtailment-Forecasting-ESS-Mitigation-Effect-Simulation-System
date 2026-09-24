@@ -95,7 +95,7 @@ class HourlyPrediction(BaseModel):
             "풍력 + demand_forecast_mw가 있을 때만 값이 존재하고, 태양광은 07장 사유로 null 고정. "
             "⚠ 이 값은 '기댓값'이라 개별 시간의 제어량 크기가 아니다 — /ess/simulate의 "
             "hourly_curtailment_mwh로 넘기지 말 것. 2023년 검증에서 ESS 흡수율이 "
-            "실측 36.8% 대비 87.3%로 과대평가됐다(README '알려진 한계')."
+            "실측 36.8% 대비 80.6%로 과대평가됐다(README '알려진 한계')."
         ),
     )
 

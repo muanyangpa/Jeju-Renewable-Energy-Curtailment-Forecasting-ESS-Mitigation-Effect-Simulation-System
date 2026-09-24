@@ -68,8 +68,8 @@ def predict(req: PredictRequest) -> PredictResponse:
     if use_demand:
         df["demand_mw"] = req.demand_forecast_mw
 
-    clf_name = ("classifier_wind_demand_calibrated" if use_demand
-                else f"classifier_{energy_type}_calibrated")
+    clf_name = ("classifier_wind_demand_calibrated_sigmoid" if use_demand
+                else f"classifier_{energy_type}_calibrated_sigmoid")
     classifier = _load(clf_name)
     proba = classifier["model"].predict_proba(df[classifier["features"]])[:, 1]
 
@@ -95,7 +95,7 @@ def predict(req: PredictRequest) -> PredictResponse:
 
     note = SOLAR_NOTE if energy_type == "solar" else None
     if energy_type == "wind" and not use_demand:
-        note = ("demand_forecast_mw가 없어 수요 미포함 모델(classifier_wind_calibrated)을 사용했고, "
+        note = ("demand_forecast_mw가 없어 수요 미포함 모델(classifier_wind_calibrated_sigmoid)을 사용했고, "
                 "제어량 조건부 회귀는 수요 피처가 필요해 expected_curtailment_mwh를 제공하지 않습니다.")
     elif use_demand and expected[0] is not None:
         note = ESS_WARNING

@@ -40,6 +40,11 @@ from app.model_io import MODELS_DIR, save_artifact
 
 BASE_FEATURES = ["generation_mwh", "hour_sin", "hour_cos", "month_sin", "month_cos"]
 
+# /predict가 서빙하는 보정 방식. sigmoid는 단조 변환이라 순위 지표(AUC·PR-AUC·top5)를
+# 보정 전과 동일하게 보존하면서 Brier를 개선한다. isotonic은 2단계 총합 오차만 더 낫다
+# (-14.1% vs -19.6%) — 경보·순위 품질을 우선해 sigmoid를 채택했다(README 비교표 참고).
+SERVED_METHOD = "sigmoid"
+
 TRAIN_END = "2022-07-01"
 CALIB_START, CALIB_END = "2022-07-01", "2023-01-01"
 TEST_START, TEST_END = "2023-01-01", "2024-01-01"
@@ -60,9 +65,15 @@ def make_model() -> RandomForestClassifier:
                                   random_state=42, n_jobs=-1)
 
 
-def calibrate(base: RandomForestClassifier, calib: pd.DataFrame, features: list[str]) -> CalibratedClassifierCV:
-    """기저 모델은 그대로 두고(FrozenEstimator) 보정 구간으로 isotonic 매핑만 학습."""
-    model = CalibratedClassifierCV(FrozenEstimator(base), method="isotonic")
+def calibrate(base: RandomForestClassifier, calib: pd.DataFrame, features: list[str],
+              method: str = "isotonic") -> CalibratedClassifierCV:
+    """기저 모델은 그대로 두고(FrozenEstimator) 보정 구간으로 매핑만 학습.
+
+    method="isotonic": 단조 계단함수. 자유도가 높아 데이터가 적으면 과적합하기 쉽다.
+    method="sigmoid" : Platt scaling. 파라미터 2개뿐이라 표본이 적을 때 안정적이지만
+                       확률 왜곡이 시그모이드 형태라는 가정이 맞아야 한다.
+    """
+    model = CalibratedClassifierCV(FrozenEstimator(base), method=method)
     model.fit(calib[features], calib["is_curtailed"])
     return model
 
@@ -76,19 +87,25 @@ def train_one(energy_type: str, use_demand: bool) -> list[dict]:
 
     base = make_model()
     base.fit(train[features], train["is_curtailed"])
-    calibrated = calibrate(base, calib, features)
 
     suffix = "_demand" if use_demand else ""
     name = f"classifier_{energy_type}{suffix}"
     y_test = test["is_curtailed"].to_numpy()
 
+    # 아티팩트명에 보정 방식을 명시한다 — model_used만 보고 어떤 확률인지 알 수 있어야 한다.
+    variants = [(None, base, name)]
+    for method in ("isotonic", "sigmoid"):
+        variants.append((method, calibrate(base, calib, features, method),
+                         f"{name}_calibrated_{method}"))
+
     rows = []
-    for is_cal, model, artifact_name in ((False, base, name), (True, calibrated, f"{name}_calibrated")):
+    for method, model, artifact_name in variants:
+        is_cal = method is not None
         report = classification_report(y_test, model.predict_proba(test[features])[:, 1])
         save_artifact(
             artifact_name, model, features,
             calibrated=is_cal,
-            calibration_method="isotonic (FrozenEstimator, 보정구간 전용)" if is_cal else None,
+            calibration_method=f"{method} (FrozenEstimator, 보정구간 전용)" if is_cal else None,
             calibration_period=[CALIB_START, CALIB_END] if is_cal else None,
             n_calib=len(calib) if is_cal else None,
             n_pos_calib=int(calib["is_curtailed"].sum()) if is_cal else None,
@@ -97,25 +114,26 @@ def train_one(energy_type: str, use_demand: bool) -> list[dict]:
             label_coverage=list(CURTAILMENT_COVERAGE[energy_type]),
             input_generation="actual",  # 서비스 경로 성능은 evaluate_pipeline 참고
             test_report=report,
-            served_by_predict=is_cal,
+            served_by_predict=(method == SERVED_METHOD),
         )
         rows.append({"energy_type": energy_type, "use_demand": use_demand, "calibrated": is_cal,
+                     "method": method or "none",
                      "artifact": artifact_name, "n_train": len(train),
                      "n_pos_train": int(train["is_curtailed"].sum()),
                      "n_calib": len(calib), "n_pos_calib": int(calib["is_curtailed"].sum()),
                      **report})
 
-    un, cal = rows
+    un = rows[0]
     print(f"[{name}] 학습 n={un['n_train']}(양성 {un['n_pos_train']}) "
-          f"보정 n={cal['n_calib']}(양성 {cal['n_pos_calib']}) 테스트 n={un['n']}(양성 {un['n_pos']})")
-    print(f"  보정 전: AUC={un['auc']} PR-AUC={un['pr_auc']} Brier={un['brier']} "
-          f"top5={un['top5_capture']}(최대 {un['top5_ceiling']}) prec@5%={un['top5_precision']}")
-    print(f"  보정 후: AUC={cal['auc']} PR-AUC={cal['pr_auc']} Brier={cal['brier']} "
-          f"top5={cal['top5_capture']}(최대 {cal['top5_ceiling']}) prec@5%={cal['top5_precision']}"
-          f"   <- /predict가 사용 ({name}_calibrated)")
-    if cal["n_pos_calib"] < 50:
-        print(f"  ⚠ 보정 구간 양성이 {cal['n_pos_calib']}건뿐 — isotonic 매핑이 불안정할 수 있다")
-    warn = saturation_warning(cal)
+          f"보정 n={un['n_calib']}(양성 {un['n_pos_calib']}) 테스트 n={un['n']}(양성 {un['n_pos']})")
+    for r in rows:
+        tag = {"none": "보정 전  ", "isotonic": "isotonic", "sigmoid": "sigmoid "}[r["method"]]
+        served = "   <- /predict가 사용" if r["method"] == SERVED_METHOD else ""
+        print(f"  {tag}: AUC={r['auc']} PR-AUC={r['pr_auc']} Brier={r['brier']} "
+              f"top5={r['top5_capture']}(최대 {r['top5_ceiling']}) prec@5%={r['top5_precision']}{served}")
+    if un["n_pos_calib"] < 50:
+        print(f"  ⚠ 보정 구간 양성이 {un['n_pos_calib']}건뿐 — 특히 isotonic이 불안정할 수 있다")
+    warn = saturation_warning(next(r for r in rows if r["method"] == SERVED_METHOD))
     if warn:
         print("  ⚠ " + warn)
     return rows

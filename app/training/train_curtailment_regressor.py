@@ -11,7 +11,7 @@
 크기'는 서로 다른 문제이므로 분리한다.
 
   ① stage1: 출력제어 발생 확률 P(curtail).
-     train_classifier가 만든 classifier_wind_demand_calibrated(isotonic 보정)를 그대로 쓴다 —
+     train_classifier가 만든 classifier_wind_demand_calibrated_sigmoid를 그대로 쓴다 —
      /predict가 서빙하는 확률과 같은 모델이어야 expected = probability x 조건부가 성립한다.
   ② stage2: 제어가 발생한 시간만으로 학습한 조건부 제어량 E[MWh | curtail].
      0인 시간을 아예 보지 않으므로 shrinkage가 없다.
@@ -33,14 +33,15 @@ import os
 
 import numpy as np
 import pandas as pd
-from sklearn.ensemble import RandomForestRegressor
-from sklearn.metrics import mean_absolute_error
+from sklearn.ensemble import HistGradientBoostingRegressor, RandomForestRegressor
+from sklearn.metrics import mean_absolute_error, mean_pinball_loss
 
 from app.data_prep import add_time_features, build_labeled_hourly, load_asos_multi, load_demand_actual
 from app.metrics import classification_report
 from app.model_io import MODELS_DIR, load_artifact, save_artifact
-from app.training.train_classifier import build_dataset as _clf_dataset, calibrate, make_model
+from app.training.train_classifier import SERVED_METHOD, build_dataset as _clf_dataset, calibrate, make_model
 from app.services.ess_simulation import simulate_hourly_capped
+from app.quantile_ensemble import QUANTILES, QuantileEnsemble, ResidualEnsemble
 
 FEATURES = ["generation_mwh", "hour_sin", "hour_cos", "month_sin", "month_cos", "demand_mw"]
 
@@ -50,6 +51,16 @@ TEST_START, TEST_END = "2023-01-01", "2024-01-01"
 THR_VAL_START, THR_VAL_END = "2022-01-01", "2023-01-01"
 
 ESS_RATED_MW = 22.5  # 07장 기준 ESS 정격출력. 실측 제어량 기준 2023 흡수율 36.8%의 기준값.
+ESS_CAPS = (22.5, 30.0, 40.0)  # 용량 슬라이더(04장 03번) 범위 점검용
+
+# stage2 분위수 앙상블: 학습 2021~2022 제어시간, 하이퍼파라미터는 2022를 검증셋으로 선택
+Q_TRAIN_START, Q_HP_SPLIT = "2021-01-01", "2022-01-01"
+HP_GRID = (
+    {"max_depth": 4, "learning_rate": 0.05, "max_iter": 300, "min_samples_leaf": 20},
+    {"max_depth": 6, "learning_rate": 0.06, "max_iter": 400, "min_samples_leaf": 20},
+    {"max_depth": 6, "learning_rate": 0.03, "max_iter": 800, "min_samples_leaf": 40},
+    {"max_depth": 8, "learning_rate": 0.06, "max_iter": 400, "min_samples_leaf": 40},
+)
 
 
 # ---------------------------------------------------------------------------
@@ -79,11 +90,11 @@ def _with_gen(df: pd.DataFrame, gen_col: str) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
-# ① stage1: 보정된 발생확률 — train_classifier가 만든 classifier_wind_demand_calibrated를 그대로 쓴다
+# ① stage1: 보정된 발생확률 — train_classifier가 만든 classifier_wind_demand_calibrated_sigmoid를 그대로 쓴다
 #    (/predict가 서빙하는 확률과 동일한 모델이어야 expected = probability x 조건부가 성립한다)
 # ---------------------------------------------------------------------------
 
-STAGE1_NAME = "classifier_wind_demand_calibrated"
+STAGE1_NAME = "classifier_wind_demand_calibrated_sigmoid"
 
 
 def load_stage1() -> dict:
@@ -102,6 +113,60 @@ def fit_stage2(train: pd.DataFrame, gen_col: str) -> RandomForestRegressor:
     return model
 
 
+def _fit_quantiles(train: pd.DataFrame, gen_col: str, hp: dict) -> QuantileEnsemble:
+    """제어 발생 시간만으로 분위수 19개를 각각 학습."""
+    cur = train[train["curtailment_mwh"] > 0]
+    x = _with_gen(cur, gen_col)[FEATURES]
+    y = cur["curtailment_mwh"]
+    models = {}
+    for q in QUANTILES:
+        m = HistGradientBoostingRegressor(loss="quantile", quantile=q, random_state=42, **hp)
+        m.fit(x, y)
+        models[q] = m
+    return QuantileEnsemble(models)
+
+
+def select_hyperparams(df: pd.DataFrame, gen_col: str) -> dict:
+    """2021 제어시간으로 학습하고 2022 제어시간의 평균 pinball loss로 하이퍼파라미터를 고른다."""
+    tr = df[(df["dt"] >= Q_TRAIN_START) & (df["dt"] < Q_HP_SPLIT)]
+    va = df[(df["dt"] >= Q_HP_SPLIT) & (df["dt"] < TEST_START)]
+    va_cur = va[va["curtailment_mwh"] > 0]
+    xv = _with_gen(va_cur, gen_col)[FEATURES]
+    yv = va_cur["curtailment_mwh"].to_numpy()
+
+    rows = []
+    for hp in HP_GRID:
+        ens = _fit_quantiles(tr, gen_col, hp)
+        preds = ens.predict_quantiles(xv)
+        loss = float(np.mean([mean_pinball_loss(yv, preds[:, i], alpha=q)
+                              for i, q in enumerate(ens.quantiles)]))
+        rows.append({**hp, "mean_pinball_loss": round(loss, 4)})
+    best = min(rows, key=lambda r: r["mean_pinball_loss"])
+    return {"best": {k: v for k, v in best.items() if k != "mean_pinball_loss"},
+            "val_period": f"{Q_HP_SPLIT}~{TEST_START}", "n_val_curtailed": len(va_cur), "grid": rows}
+
+
+def coverage_table(ens, x_test, y_true: np.ndarray) -> list[dict]:
+    """②: 각 분위수에서 '실측 <= 예측' 비율. 잘 보정됐으면 명목 분위수와 같아야 한다."""
+    preds = ens.predict_quantiles(x_test)
+    return [{"quantile": q, "nominal": q,
+             "empirical_coverage": round(float((y_true <= preds[:, i]).mean()), 4),
+             "gap_pp": round(float((y_true <= preds[:, i]).mean() - q) * 100, 1)}
+            for i, q in enumerate(ens.quantiles)]
+
+
+def absorption_from_distribution(ens, x, p_curt: np.ndarray, cap: float) -> dict:
+    """③: 시간별 E[X], E[min(X,cap)]에 보정 확률을 곱해 흡수율을 구한다.
+
+    출력제어가 없는 시간은 제어량도 흡수량도 0이므로, 조건부 기댓값에 P(curtail)을 곱한 것이
+    무조건부 기댓값이 된다.
+    """
+    total = float((p_curt * ens.expected_value(x)).sum())
+    absorbed = float((p_curt * ens.expected_capped(x, cap)).sum())
+    return {"total_curtailment_mwh": total, "total_absorbed_mwh": absorbed,
+            "absorption_rate": absorbed / total if total > 0 else 0.0}
+
+
 def _predict(model, df: pd.DataFrame, gen_col: str, proba: bool = False) -> np.ndarray:
     x = _with_gen(df, gen_col)
     if proba:
@@ -113,41 +178,64 @@ def _predict(model, df: pd.DataFrame, gen_col: str, proba: bool = False) -> np.n
 # 임계값 선정 (2022년, 2022 이전만으로 학습한 모델 사용 -> 리키지 없음)
 # ---------------------------------------------------------------------------
 
-def choose_threshold() -> dict:
+def choose_threshold(df: pd.DataFrame) -> dict:
     """임계값은 기저학습·보정·2023테스트 어디에도 쓰지 않은 구간에서 고른다.
 
-    배포 모델(classifier_wind_demand_calibrated)은 2022-07-01까지 학습 + 2022 하반기로 보정했으므로,
-    2022년 어디를 써도 그 모델에는 in-sample이다. 그래서 임계값 선정 전용으로 한 칸씩 앞당긴
-    모델을 따로 만든다 — 기저 <2022-01-01, 보정 2022 상반기, 임계값 선정 2022 하반기.
-    배포 모델과 같은 방식으로 보정된 확률이므로 임계값이 옮겨갈 수 있다.
+    배포 모델(classifier_wind_demand_calibrated_sigmoid)은 2022-07-01까지 학습 + 2022 하반기로 보정했고
+    배포 stage2도 2023 이전 전체로 학습했으므로, 2022년 어디를 써도 배포 모델에는 in-sample이다.
+    그래서 임계값 선정 전용으로 한 칸씩 앞당긴 모델 쌍을 따로 만든다.
+
+      분류기: 기저 <2022-01-01 + isotonic(2022-01-01~2022-07-01)
+      조건부 회귀: <2022-07-01 의 제어 발생 시간만
+      임계값 선정 구간: 2022-07-01~2023-01-01 (위 어느 쪽에도 미사용)
+
+    [기준] 총 제어량 일치 — 선정 구간에서 sum(임계값 계열)이 실측 총 제어량과 가장 가까운 임계값.
+    ESS 흡수율은 에너지 회계이므로 '몇 시간을 맞혔나'(F1)가 아니라 '총 MWh가 맞나'가 목적함수다.
+    F1 최대 기준도 함께 계산해 비교용으로 남긴다.
     """
-    df, features = _clf_dataset("wind", use_demand=True)
     base_tr = df[df["dt"] < "2022-01-01"]
     calib = df[(df["dt"] >= "2022-01-01") & (df["dt"] < "2022-07-01")]
-    val = df[(df["dt"] >= "2022-07-01") & (df["dt"] < "2023-01-01")]
+    sel = df[(df["dt"] >= "2022-07-01") & (df["dt"] < "2023-01-01")]
 
     base = make_model()
-    base.fit(base_tr[features], base_tr["is_curtailed"])
-    clf = calibrate(base, calib, features)
-    p = clf.predict_proba(val[features])[:, 1]
-    y = val["is_curtailed"].to_numpy().astype(bool)
+    base.fit(_with_gen(base_tr, "generation_mwh")[FEATURES], base_tr["is_curtailed"])
+    # 배포 모델과 같은 보정 방식이어야 임계값이 같은 확률 척도 위에 놓인다
+    clf = calibrate(base, _with_gen(calib, "generation_mwh"), FEATURES, SERVED_METHOD)
+    s2 = fit_stage2(df[df["dt"] < "2022-07-01"], "generation_pred")
 
-    best = None
-    for thr in np.arange(0.02, 0.96, 0.01):
+    p = clf.predict_proba(_with_gen(sel, "generation_pred")[FEATURES])[:, 1]
+    c = _predict(s2, sel, "generation_pred")
+    y = sel["curtailment_mwh"].to_numpy()
+    pos = y > 0
+    actual_total = float(y.sum())
+
+    rows = []
+    for thr in np.arange(0.01, 0.96, 0.01):
         pred = p >= thr
-        tp = int((pred & y).sum())
+        tp = int((pred & pos).sum())
         if tp == 0:
             continue
         precision = tp / int(pred.sum())
-        recall = tp / int(y.sum())
-        f1 = 2 * precision * recall / (precision + recall)
-        if best is None or f1 > best["f1"]:
-            best = {"threshold": round(float(thr), 2), "f1": round(f1, 4),
-                    "precision": round(precision, 4), "recall": round(recall, 4)}
-    best.update({"selection_period": "2022-07-01~2023-01-01", "n_val": len(val),
-                 "n_pos_val": int(y.sum()),
-                 "selection_model": "기저<2022-01-01 + isotonic(2022-01-01~2022-07-01)"})
-    return best
+        recall = tp / int(pos.sum())
+        total = float(np.where(pred, c, 0.0).sum())
+        rows.append({"threshold": round(float(thr), 2),
+                     "f1": round(2 * precision * recall / (precision + recall), 4),
+                     "precision": round(precision, 4), "recall": round(recall, 4),
+                     "total_mwh": round(total, 1),
+                     "total_ratio": round(total / actual_total, 4) if actual_total else None})
+
+    by_total = min(rows, key=lambda r: abs(r["total_mwh"] - actual_total))
+    by_f1 = max(rows, key=lambda r: r["f1"])
+    meta = {"selection_period": "2022-07-01~2023-01-01", "n_sel": len(sel),
+            "n_pos_sel": int(pos.sum()), "actual_total_mwh_sel": round(actual_total, 1),
+            "selection_model": f"기저 <2022-01-01 + {SERVED_METHOD}(2022-01-01~2022-07-01), stage2 <2022-07-01"}
+    # 운영 임계값은 F1 최대(탐지 품질) 기준이다. 총 제어량 일치 기준도 계산해 함께 남기지만,
+    # ESS 에너지 회계용으로는 실패했고(README (b)) 보정 방식에 따라 격자 하한에 붙는
+    # 경계해가 되기도 한다 — 운영값으로 쓰지 않는다.
+    boundary = by_total["threshold"] <= rows[0]["threshold"] + 1e-9
+    return {"criterion": "f1_max", **by_f1, **meta,
+            "total_match_alternative": {**by_total, "is_boundary_solution": bool(boundary)},
+            "grid": rows}
 
 
 # ---------------------------------------------------------------------------
@@ -207,24 +295,87 @@ def main() -> dict:
             "total_error_pct": round((total - actual_total) / actual_total * 100, 1),
         })
 
+    # --- (c) 분포 방식: 분위수 앙상블 / 잔차 앙상블 ---
+    hp_info = select_hyperparams(df, "generation_pred")
+    qens = _fit_quantiles(train, "generation_pred", hp_info["best"])
+    x_test = _with_gen(test, "generation_pred")[FEATURES]
+
+    # ②: 2023 제어 발생 시간에서의 커버리지
+    cov_rows = coverage_table(qens, x_test[curtailed], y[curtailed])
+
+    # ④ 대조군: 점 예측 + 2022 경험적 잔차.
+    # 잔차는 out-of-sample이어야 퍼짐이 과소평가되지 않으므로 2021만으로 학습한 모델로 뽑는다.
+    rf_2021 = fit_stage2(df[df["dt"] < Q_HP_SPLIT], "generation_pred")
+    va = df[(df["dt"] >= Q_HP_SPLIT) & (df["dt"] < TEST_START)]
+    va_cur = va[va["curtailment_mwh"] > 0]
+    resid = (va_cur["curtailment_mwh"].to_numpy()
+             - _predict(rf_2021, va_cur, "generation_pred"))
+    rens_raw = ResidualEnsemble(stage2[deployed], resid, center=False)
+    rens = ResidualEnsemble(stage2[deployed], resid, center=True)
+
+    cap_rows = []
+    for cap in ESS_CAPS:
+        base_c = simulate_hourly_capped(y.tolist(), cap)
+        row = {"cap_mw": cap, "actual_absorption_rate": round(base_c.absorption_rate, 4),
+               "actual_total_mwh": round(actual_total, 1)}
+        for label, ens in (("residual_raw", rens_raw), ("residual", rens), ("quantile", qens)):
+            r = absorption_from_distribution(ens, x_test, p_serving, cap)
+            row[f"{label}_absorption_rate"] = round(r["absorption_rate"], 4)
+            row[f"{label}_error_pp"] = round((r["absorption_rate"] - base_c.absorption_rate) * 100, 2)
+            row[f"{label}_total_mwh"] = round(r["total_curtailment_mwh"], 1)
+            row[f"{label}_total_error_pct"] = round(
+                (r["total_curtailment_mwh"] - actual_total) / actual_total * 100, 1)
+        cap_rows.append(row)
+
+    METHODS = ("residual_raw", "residual", "quantile")
+    # ⑤ 판정: 모든 cap에서 ±5%p 안에 드는 방식이 있는가
+    usable = [m for m in METHODS if all(abs(r[f"{m}_error_pp"]) <= 5.0 for r in cap_rows)]
+
     # --- (b) 임계값 방식 -> ESS hourly_capped 흡수율 ---
-    thr_info = choose_threshold()
-    thr = thr_info["threshold"]
+    thr_info = choose_threshold(df)
+    thr = thr_info["threshold"]                                  # F1 최대 — 운영(탐지 경보)용
+    alt_thr = thr_info["total_match_alternative"]["threshold"]   # 총 제어량 일치 — 비교용(실패)
     ess_rows = []
     baseline = simulate_hourly_capped(y.tolist(), ESS_RATED_MW)
     ess_rows.append({"series": "actual_curtailment", "threshold": None,
                      "total_curtailment_mwh": round(baseline.total_curtailment_mwh, 1),
                      "total_absorbed_mwh": round(baseline.total_absorbed_mwh, 1),
                      "absorption_rate": round(baseline.absorption_rate, 4)})
-    for series_name, p, c in (("threshold_converter_input", p_serving, cond),
-                              ("expected_value_converter_input", p_serving, cond)):
-        hourly = (np.where(p >= thr, c, 0.0) if series_name.startswith("threshold") else p * c).tolist()
-        r = simulate_hourly_capped(hourly, ESS_RATED_MW)
-        ess_rows.append({"series": series_name, "threshold": thr if series_name.startswith("threshold") else None,
+    for label, t in (("threshold_f1max(운영)", thr), ("threshold_total_match", alt_thr)):
+        series = np.where(p_serving >= t, cond, 0.0)
+        r = simulate_hourly_capped(series.tolist(), ESS_RATED_MW)
+        ess_rows.append({"series": label, "threshold": t,
                          "total_curtailment_mwh": round(r.total_curtailment_mwh, 1),
+                         "total_ratio_vs_actual": round(r.total_curtailment_mwh / actual_total, 2),
                          "total_absorbed_mwh": round(r.total_absorbed_mwh, 1),
                          "absorption_rate": round(r.absorption_rate, 4),
                          "absorption_rate_abs_error_pp": round((r.absorption_rate - baseline.absorption_rate) * 100, 2)})
+
+    ev = p_serving * cond
+    r = simulate_hourly_capped(ev.tolist(), ESS_RATED_MW)
+    ess_rows.append({"series": "expected_value", "threshold": None,
+                     "total_curtailment_mwh": round(r.total_curtailment_mwh, 1),
+                     "total_ratio_vs_actual": round(r.total_curtailment_mwh / actual_total, 2),
+                     "total_absorbed_mwh": round(r.total_absorbed_mwh, 1),
+                     "absorption_rate": round(r.absorption_rate, 4),
+                     "absorption_rate_abs_error_pp": round((r.absorption_rate - baseline.absorption_rate) * 100, 2)})
+
+    # 오라클: 2023 총합이 가장 잘 맞는 임계값을 '테스트를 보고' 고른다.
+    # 임계값 튜닝으로 도달 가능한 상한을 보기 위한 진단용 — 운영에 쓸 수 없는 값이다.
+    oracle_t, oracle_r = None, None
+    for t in np.arange(0.005, 0.95, 0.005):
+        ser = np.where(p_serving >= t, cond, 0.0)
+        if ser.sum() == 0:
+            continue
+        if oracle_t is None or abs(ser.sum() - actual_total) < abs(oracle_best - actual_total):
+            oracle_t, oracle_best = float(t), float(ser.sum())
+            oracle_r = simulate_hourly_capped(ser.tolist(), ESS_RATED_MW)
+    ess_rows.append({"series": "threshold_oracle_2023 (진단용, 운영 불가)", "threshold": round(oracle_t, 3),
+                     "total_curtailment_mwh": round(oracle_r.total_curtailment_mwh, 1),
+                     "total_ratio_vs_actual": round(oracle_r.total_curtailment_mwh / actual_total, 2),
+                     "total_absorbed_mwh": round(oracle_r.total_absorbed_mwh, 1),
+                     "absorption_rate": round(oracle_r.absorption_rate, 4),
+                     "absorption_rate_abs_error_pp": round((oracle_r.absorption_rate - baseline.absorption_rate) * 100, 2)})
 
     # --- 아티팩트 저장 (stage1은 train_classifier가 저장한 보정 분류기를 재사용) ---
     p2 = save_artifact("curtailment_stage2_wind", stage2[deployed], FEATURES,
@@ -233,12 +384,15 @@ def main() -> dict:
                        stage1_calibration_period=stage1_art["meta"].get("calibration_period"),
                        train_period=[str(train["dt"].min()), str(train["dt"].max())],
                        test_period=[TEST_START, TEST_END], input_generation=deployed,
-                       ess_threshold=thr, threshold_selection=thr_info, mae_matrix=mae_rows)
+                       ess_threshold=thr, threshold_criterion="f1_max (탐지 경보용)",
+                       threshold_selection={k: v for k, v in thr_info.items() if k != "grid"},
+                       mae_matrix=mae_rows)
 
     pd.DataFrame(stage1_rows).to_csv(os.path.join(MODELS_DIR, "curtailment_stage1_metrics.csv"), index=False)
     pd.DataFrame(mae_rows).to_csv(os.path.join(MODELS_DIR, "curtailment_stage2_mae.csv"), index=False)
     pd.DataFrame(expected_rows).to_csv(os.path.join(MODELS_DIR, "curtailment_regressor_metrics.csv"), index=False)
     pd.DataFrame(ess_rows).to_csv(os.path.join(MODELS_DIR, "curtailment_ess_eval.csv"), index=False)
+    pd.DataFrame(thr_info["grid"]).to_csv(os.path.join(MODELS_DIR, "curtailment_threshold_grid.csv"), index=False)
 
     # --- 출력 ---
     print(f"\n[stage1={STAGE1_NAME}] 2023 분류 성능 (/predict의 curtailment_probability 출처)")
@@ -256,15 +410,65 @@ def main() -> dict:
         print(f"  {r['input']:>22}: {r['predicted_total_mwh_2023']:>9.1f}MWh ({r['total_error_pct']:+.1f}%)")
 
     print(f"\n[(b) 임계값 방식 -> ESS {ESS_RATED_MW}MW hourly_capped]")
-    print(f"  임계값 {thr} (2022년 검증구간에서 F1 최대, F1={thr_info['f1']} "
-          f"정밀도={thr_info['precision']} 재현율={thr_info['recall']})\n"
-          f"     선정구간 {thr_info['selection_period']}, 선정모델 {thr_info['selection_model']}")
+    alt = thr_info["total_match_alternative"]
+    print(f"  운영 임계값 {thr} — 기준: F1 최대(탐지) "
+          f"(F1={thr_info['f1']} 정밀도={thr_info['precision']} 재현율={thr_info['recall']}, "
+          f"선정구간 총 제어량 비율 {thr_info['total_ratio']}배)")
+    print(f"     비교) 총 제어량 일치 기준이면 {alt['threshold']} (비율 {alt['total_ratio']}배)"
+          + ("  ⚠ 격자 하한에 붙은 경계해 — 운영 불가" if alt["is_boundary_solution"] else ""))
+    print(f"     선정구간 {thr_info['selection_period']}, 선정모델 {thr_info['selection_model']}")
     for r in ess_rows:
-        extra = f" (실측 대비 {r['absorption_rate_abs_error_pp']:+.2f}%p)" if "absorption_rate_abs_error_pp" in r else " ← 기준"
-        print(f"  {r['series']:>30}: 제어량합 {r['total_curtailment_mwh']:>8.1f}MWh "
-              f"흡수 {r['total_absorbed_mwh']:>7.1f}MWh 흡수율 {r['absorption_rate']:.1%}{extra}")
+        extra = (" ← 기준" if r["series"] == "actual_curtailment"
+                 else f" (실측 대비 {r['absorption_rate_abs_error_pp']:+.2f}%p)")
+        ratio = f" [{r['total_ratio_vs_actual']}x]" if r.get("total_ratio_vs_actual") else ""
+        print(f"  {r['series']:>38}: 제어량합 {r['total_curtailment_mwh']:>8.1f}MWh{ratio:>8} "
+              f"흡수율 {r['absorption_rate']:.1%}{extra}")
+    print("  ※ 오라클은 2023을 보고 고른 상한 진단값 — 총합을 1.00x로 맞춰도 흡수율은 여전히 실측과 벌어진다.")
 
-    return {"mae": mae_rows, "expected": expected_rows, "ess": ess_rows, "threshold": thr_info}
+    print(f"\n[② 분위수 커버리지] 2023 제어 발생 {int(curtailed.sum())}시간, '실측 <= 예측' 비율")
+    print("  " + "  ".join(f"{r['quantile']:.2f}" for r in cov_rows))
+    print("  " + "  ".join(f"{r['empirical_coverage']:.2f}" for r in cov_rows))
+    print("  " + "  ".join(f"{r['gap_pp']:+.0f}" for r in cov_rows) + "   (%p 격차)")
+    print(f"  하이퍼파라미터: {hp_info['best']} (2022 제어시간 {hp_info['n_val_curtailed']}건, "
+          f"평균 pinball loss 최소)")
+
+    print(f"\n[③④ 분포 적분 방식 흡수율] E[min(X,cap)] x P(curtail)")
+    print(f"{'cap':>8} {'실측기반':>9} {'잔차(원본)':>13} {'잔차(중심화)':>15} {'분위수':>13}")
+    for r in cap_rows:
+        print(f"{r['cap_mw']:>6.1f}MW {r['actual_absorption_rate']:>9.1%} "
+              f"{r['residual_raw_absorption_rate']:>8.1%} {r['residual_raw_error_pp']:>+6.2f}%p "
+              f"{r['residual_absorption_rate']:>9.1%} {r['residual_error_pp']:>+6.2f}%p "
+              f"{r['quantile_absorption_rate']:>7.1%} {r['quantile_error_pp']:>+6.2f}%p")
+    r0 = cap_rows[0]
+    print(f"  총 제어량(실측 {r0['actual_total_mwh']:.0f}MWh): "
+          f"잔차원본 {r0['residual_raw_total_mwh']:.0f} ({r0['residual_raw_total_error_pct']:+.1f}%) | "
+          f"잔차중심화 {r0['residual_total_mwh']:.0f} ({r0['residual_total_error_pct']:+.1f}%) | "
+          f"분위수 {r0['quantile_total_mwh']:.0f} ({r0['quantile_total_error_pct']:+.1f}%)")
+    if usable:
+        print(f"  ✅ 모든 cap에서 ±5%p 안에 드는 방식: {', '.join(usable)}")
+    else:
+        print("  ❌ ±5%p 안에 드는 방식 없음 — 대시보드는 실측 기반 계산만 쓸 것")
+
+    pd.DataFrame(cov_rows).to_csv(os.path.join(MODELS_DIR, "curtailment_quantile_coverage.csv"), index=False)
+    pd.DataFrame(cap_rows).to_csv(os.path.join(MODELS_DIR, "curtailment_absorption_by_cap.csv"), index=False)
+    pd.DataFrame(hp_info["grid"]).to_csv(os.path.join(MODELS_DIR, "curtailment_quantile_hp.csv"), index=False)
+    save_artifact("curtailment_stage2_residual_wind", rens, FEATURES,
+                  stage="2_residual_ensemble (연구 검증용 — 서비스 미사용)",
+                  residual_source="2021 학습 모델의 2022 제어시간 잔차(out-of-sample)",
+                  residual_n=int(len(resid)), residual_mean_raw=round(float(resid.mean()), 2),
+                  residual_std=round(float(resid.std()), 2), centered=True,
+                  centering_decided="post-hoc (2023 결과를 본 뒤 채택 — README 참고)",
+                  point_model="curtailment_stage2_wind", input_generation="converter",
+                  test_period=[TEST_START, TEST_END], absorption_by_cap=cap_rows)
+    save_artifact("curtailment_stage2_quantile_wind", qens, FEATURES,
+                  stage="2_quantile_ensemble", quantiles=list(QUANTILES),
+                  hyperparams=hp_info["best"], hp_val_period=hp_info["val_period"],
+                  train_period=[str(train["dt"].min()), str(train["dt"].max())],
+                  trained_on_curtailed_hours_only=True, input_generation="converter",
+                  test_period=[TEST_START, TEST_END], coverage=cov_rows, absorption_by_cap=cap_rows)
+
+    return {"mae": mae_rows, "expected": expected_rows, "ess": ess_rows, "threshold": thr_info,
+            "coverage": cov_rows, "caps": cap_rows, "hp": hp_info}
 
 
 if __name__ == "__main__":
