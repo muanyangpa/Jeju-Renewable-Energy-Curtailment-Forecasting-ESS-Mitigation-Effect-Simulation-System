@@ -39,6 +39,30 @@ def save_artifact(name: str, model, features: list[str], **meta) -> str:
     return path
 
 
+def converter_predict_mwh(artifact: dict, X) -> np.ndarray:
+    """컨버터 예측을 항상 MWh로 돌려준다.
+
+    태양광 컨버터는 타깃이 '이용률'이라 그대로 쓰면 0~1 값이 나온다. 이걸 MWh로
+    환산하지 않고 분류기에 넣으면 capacity_factor가 수백 배 작아져 예측이 무작위가 된다
+    (실제로 이 실수로 태양광 서비스 경로 AUC가 0.99 -> 0.59로 무너진 적이 있다).
+    서빙(predict.py)과 평가 스크립트가 같은 경로를 타도록 여기 한 곳에 모아 둔다.
+
+    곱하는 상수는 분류기가 나눌 때 쓰는 값과 같으므로, 분류기 입력 기준으로는 정확히
+    상쇄된다 — 즉 상수의 절대값이 분류 성능에 영향을 주지 않는다.
+    """
+    raw = np.clip(artifact["model"].predict(X[artifact["features"]]), 0, None)
+    meta = artifact.get("meta") or {}
+    if meta.get("target") == "capacity_factor":
+        proxy = meta.get("capacity_proxy_mwh")
+        if not proxy:
+            raise RuntimeError(
+                f"{meta.get('name')}: 이용률 타깃인데 capacity_proxy_mwh가 없습니다 — "
+                f"`python -m app.training.train_converter`로 재학습하세요"
+            )
+        raw = raw * float(proxy)
+    return raw
+
+
 def load_artifact(name: str) -> dict:
     path = os.path.join(MODELS_DIR, f"{name}.joblib")
     if not os.path.exists(path):

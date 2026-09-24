@@ -22,9 +22,10 @@ import os
 import numpy as np
 import pandas as pd
 
-from app.data_prep import add_time_features, build_labeled_hourly, load_asos, load_asos_multi, load_demand_actual
+from app.data_prep import (add_normalized_features, add_time_features, build_labeled_hourly,
+                           load_asos, load_asos_multi, load_demand_actual, load_generation_actual)
 from app.metrics import classification_report, saturation_warning
-from app.model_io import MODELS_DIR, load_artifact
+from app.model_io import MODELS_DIR, converter_predict_mwh, load_artifact
 
 TEST_START, TEST_END = "2023-01-01", "2024-01-01"
 
@@ -41,18 +42,21 @@ def evaluate(energy_type: str, use_demand: bool) -> list[dict]:
     classifier = load_artifact(clf_name)
 
     labeled = build_labeled_hourly(energy_type)
+    labeled = add_normalized_features(labeled, load_generation_actual(energy_type), load_demand_actual())
     labeled = labeled[(labeled["dt"] >= TEST_START) & (labeled["dt"] < TEST_END)]
     weather = _weather(energy_type)
     df = labeled.merge(weather, on="dt", how="inner")
-    if use_demand:
-        df = df.merge(load_demand_actual(), on="dt", how="inner")
     df = df.dropna(subset=converter["features"] + ["generation_mwh"]).reset_index(drop=True)
 
-    df["generation_pred"] = np.clip(converter["model"].predict(df[converter["features"]]), 0, None)
+    df["generation_pred"] = converter_predict_mwh(converter, df)
 
     rows = []
     for input_name, gen_col in (("actual_generation", "generation_mwh"), ("converter_generation", "generation_pred")):
-        x = df.rename(columns={"generation_mwh": "_gen_actual"}).assign(generation_mwh=df[gen_col])
+        # 파생 피처(capacity_factor·penetration)도 해당 발전량 기준으로 다시 계산해야 한다
+        x = df.assign(generation_mwh=df[gen_col])
+        x["capacity_factor"] = x["generation_mwh"] / x["capacity_proxy_mwh"]
+        if "demand_mw" in x.columns:
+            x["penetration"] = x["generation_mwh"] / x["demand_mw"]
         proba = classifier["model"].predict_proba(x[classifier["features"]])[:, 1]
         rep = classification_report(df["is_curtailed"].to_numpy(), proba)
         rows.append({"model": clf_name, "input": input_name, **rep})
@@ -72,7 +76,8 @@ def evaluate(energy_type: str, use_demand: bool) -> list[dict]:
 
 
 if __name__ == "__main__":
-    results = evaluate("solar", False) + evaluate("wind", False) + evaluate("wind", True)
+    results = (evaluate("solar", False) + evaluate("solar", True)
+               + evaluate("wind", False) + evaluate("wind", True))
     out = os.path.join(MODELS_DIR, "pipeline_eval_metrics.csv")
     pd.DataFrame(results).to_csv(out, index=False)
     print(f"\n저장: {out}")

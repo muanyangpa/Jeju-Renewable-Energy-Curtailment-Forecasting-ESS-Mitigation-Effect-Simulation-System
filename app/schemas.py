@@ -45,7 +45,7 @@ class PredictRequest(BaseModel):
     target_date: date
     weather: list[WeatherHour] = Field(..., description="정확히 24개, 1~24시 각 1회")
     demand_forecast_mw: Optional[list[float]] = Field(
-        None, description="24개, 풍력 전용(수요 정식 채택 피처, 05장). 태양광은 무시됨"
+        None, description="24개(선택). 있으면 침투율(발전량/수요) 포함 모델을 사용한다 — 태양광·풍력 모두 정확도가 올라간다(태양광 PR-AUC 0.639->0.711). 풍력은 수요 자체도 정식 피처다(05장). 생략하면 미포함 모델로 자동 전환되고 풍력의 expected_curtailment_mwh는 null이 된다"
     )
 
     @field_validator("weather")
@@ -84,8 +84,9 @@ class HourlyPrediction(BaseModel):
     hour: int
     generation_forecast_mwh: float
     curtailment_probability: float = Field(
-        ..., description="출력제어 발생 확률 0~1. 산출 모델은 model_used 참고 — 풍력+수요예측이면 "
-                         "isotonic 보정된 확률이다"
+        ..., description="출력제어 발생 확률 0~1. sigmoid 보정된 값이라 보정 전 모델과 크기가 "
+                         "다르다. 0.5 같은 고정 임계값을 쓰지 말 것(README '운영 임계값' 참고). "
+                         "산출 모델은 model_used 참고"
     )
     expected_curtailment_mwh: Optional[float] = Field(
         None,
@@ -106,11 +107,10 @@ class PredictResponse(BaseModel):
     target_date: date
     hourly: list[HourlyPrediction]
     model_used: str = Field(
-        ..., description="curtailment_probability를 산출한 모델 이름. "
-                         "풍력+demand_forecast_mw: 'curtailment_stage1_wind'(isotonic 보정, 2단계 1단계). "
-                         "풍력에서 demand_forecast_mw를 생략하면 'classifier_wind'(수요 미포함), "
-                         "태양광은 'classifier_solar'. 2단계 아티팩트가 없으면 "
-                         "'classifier_wind_demand'로 대체되고 expected_curtailment_mwh는 null이 된다"
+        ..., description="curtailment_probability를 산출한 sigmoid 보정 모델 이름. "
+                         "demand_forecast_mw가 있으면 'classifier_{solar|wind}_demand_calibrated_sigmoid', "
+                         "없으면 'classifier_{solar|wind}_calibrated_sigmoid'. "
+                         "값을 하드코딩해 분기하지 말 것 — 보정 방식이 바뀌면 이름도 바뀐다"
     )
     note: Optional[str] = Field(
         None, description="태양광 응답에는 expected_curtailment_mwh가 null인 이유를 항상 포함"

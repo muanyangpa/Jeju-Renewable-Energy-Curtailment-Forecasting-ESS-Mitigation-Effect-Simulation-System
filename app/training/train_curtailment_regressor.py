@@ -36,9 +36,10 @@ import pandas as pd
 from sklearn.ensemble import HistGradientBoostingRegressor, RandomForestRegressor
 from sklearn.metrics import mean_absolute_error, mean_pinball_loss
 
-from app.data_prep import add_time_features, build_labeled_hourly, load_asos_multi, load_demand_actual
+from app.data_prep import (add_normalized_features, add_time_features, build_labeled_hourly,
+                           load_asos_multi, load_demand_actual, load_generation_actual)
 from app.metrics import classification_report
-from app.model_io import MODELS_DIR, load_artifact, save_artifact
+from app.model_io import MODELS_DIR, converter_predict_mwh, load_artifact, save_artifact
 from app.training.train_classifier import SERVED_METHOD, build_dataset as _clf_dataset, calibrate, make_model
 from app.services.ess_simulation import simulate_hourly_capped
 from app.quantile_ensemble import QUANTILES, QuantileEnsemble, ResidualEnsemble
@@ -69,23 +70,33 @@ HP_GRID = (
 
 def build_dataset() -> pd.DataFrame:
     """전체 달력 + 시간피처 + 수요 + 컨버터 예측 발전량(generation_pred)."""
+    gen = load_generation_actual("wind")
     df = add_time_features(build_labeled_hourly("wind"))
-    df = df.merge(load_demand_actual(), on="dt", how="inner")
+    # stage1(보정 분류기)이 capacity_factor·penetration을 쓰므로 여기서도 같이 만들어 둔다
+    df = add_normalized_features(df, gen, load_demand_actual())
 
     converter = load_artifact("converter_wind")
     weather = add_time_features(load_asos_multi(("184", "185", "188")))
     # 컨버터 피처는 날씨쪽 컬럼이므로 weather에서 계산한 뒤 dt로 붙인다.
     weather = weather.dropna(subset=converter["features"]).copy()
-    weather["generation_pred"] = np.clip(converter["model"].predict(weather[converter["features"]]), 0, None)
+    weather["generation_pred"] = converter_predict_mwh(converter, weather)
     df = df.merge(weather[["dt", "generation_pred"]], on="dt", how="inner")
 
-    return df.dropna(subset=FEATURES + ["curtailment_mwh", "generation_pred"]).sort_values("dt").reset_index(drop=True)
+    return df.dropna(subset=FEATURES + ["curtailment_mwh", "generation_pred", "capacity_factor"]).sort_values("dt").reset_index(drop=True)
 
 
 def _with_gen(df: pd.DataFrame, gen_col: str) -> pd.DataFrame:
-    """generation_mwh 자리에 지정한 컬럼(실측 또는 컨버터 예측)을 넣은 피처 프레임."""
+    """generation_mwh 자리에 지정한 컬럼(실측 또는 컨버터 예측)을 넣은 피처 프레임.
+
+    capacity_factor·penetration은 발전량에서 파생되므로 함께 다시 계산해야 한다.
+    이걸 빼먹으면 실측 기준으로 만든 파생값에 컨버터 예측 발전량이 섞여 평가가 오염된다.
+    """
     out = df.copy()
     out["generation_mwh"] = df[gen_col]
+    if "capacity_proxy_mwh" in out.columns:
+        out["capacity_factor"] = out["generation_mwh"] / out["capacity_proxy_mwh"]
+    if "demand_mw" in out.columns:
+        out["penetration"] = out["generation_mwh"] / out["demand_mw"]
     return out
 
 
@@ -167,11 +178,14 @@ def absorption_from_distribution(ens, x, p_curt: np.ndarray, cap: float) -> dict
             "absorption_rate": absorbed / total if total > 0 else 0.0}
 
 
-def _predict(model, df: pd.DataFrame, gen_col: str, proba: bool = False) -> np.ndarray:
-    x = _with_gen(df, gen_col)
+def _predict(model, df: pd.DataFrame, gen_col: str, proba: bool = False,
+             features: list[str] | None = None) -> np.ndarray:
+    """features를 주지 않으면 stage2의 FEATURES를 쓴다.
+    stage1(분류기)은 피처 구성이 달라 반드시 artifact["features"]를 넘겨야 한다."""
+    x = _with_gen(df, gen_col)[features or FEATURES]
     if proba:
-        return model.predict_proba(x[FEATURES])[:, 1]
-    return np.clip(model.predict(x[FEATURES]), 0, None)
+        return model.predict_proba(x)[:, 1]
+    return np.clip(model.predict(x), 0, None)
 
 
 # ---------------------------------------------------------------------------
@@ -253,6 +267,7 @@ def main() -> dict:
     # --- stage1: /predict가 서빙하는 보정 분류기를 그대로 로드 ---
     stage1_art = load_stage1()
     stage1 = stage1_art["model"]
+    S1F = stage1_art["features"]
 
     # --- stage2 두 변형 비교: 학습 입력 x 평가 입력 ---
     stage2 = {v: fit_stage2(train, gen) for v, gen in (("actual", "generation_mwh"), ("converter", "generation_pred"))}
@@ -275,12 +290,12 @@ def main() -> dict:
     y_bin = (y > 0).astype(int)
     stage1_rows = []
     for input_name, gen in (("actual_generation", "generation_mwh"), ("converter_generation", "generation_pred")):
-        rep = classification_report(y_bin, _predict(stage1, test, gen, proba=True))
+        rep = classification_report(y_bin, _predict(stage1, test, gen, proba=True, features=S1F))
         stage1_rows.append({"model": STAGE1_NAME, "input": input_name, **rep})
 
     # --- (a) 기댓값(확률 x 조건부) 총합 오차 ---
-    p_actual = _predict(stage1, test, "generation_mwh", proba=True)
-    p_serving = _predict(stage1, test, "generation_pred", proba=True)
+    p_actual = _predict(stage1, test, "generation_mwh", proba=True, features=S1F)
+    p_serving = _predict(stage1, test, "generation_pred", proba=True, features=S1F)
     cond = _predict(stage2[deployed], test, "generation_pred")
     cond_actual_in = _predict(stage2[deployed], test, "generation_mwh")
 

@@ -34,11 +34,21 @@ from sklearn.calibration import CalibratedClassifierCV
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.frozen import FrozenEstimator
 
-from app.data_prep import CURTAILMENT_COVERAGE, add_time_features, build_labeled_hourly, load_demand_actual
+from app.data_prep import (CURTAILMENT_COVERAGE, add_normalized_features, add_time_features,
+                           build_labeled_hourly, latest_capacity_proxy, load_demand_actual,
+                           load_generation_actual)
 from app.metrics import classification_report, saturation_warning
 from app.model_io import MODELS_DIR, save_artifact
 
-BASE_FEATURES = ["generation_mwh", "hour_sin", "hour_cos", "month_sin", "month_cos"]
+# [2026-09-25] 발전량 절대값(MWh) -> 정규화 피처로 교체.
+# 제주 태양광 설비 증설로 MWh 분포가 해마다 위로 밀려, 학습 범위를 벗어난 입력에서
+# RandomForest가 경계에 포화됐다(2023 테스트의 3.76%가 학습 범위 밖).
+#   capacity_factor = 발전량 / 설비용량대리  -> 날씨 강도, 범위 안정
+#   penetration     = 발전량 / 수요          -> 잉여 압력, 제어의 실제 구동 요인
+# 실험 결과(models/normalization_experiment.csv): 태양광 PR-AUC 0.406 -> 0.703,
+# top5 0.493 -> 0.826. 절대 MWh를 함께 넣으면 오히려 나빠져(0.629) 완전히 뺐다.
+TIME_FEATURES = ["hour_sin", "hour_cos", "month_sin", "month_cos"]
+BASE_FEATURES = ["capacity_factor"] + TIME_FEATURES
 
 # /predict가 서빙하는 보정 방식. sigmoid는 단조 변환이라 순위 지표(AUC·PR-AUC·top5)를
 # 보정 전과 동일하게 보존하면서 Brier를 개선한다. isotonic은 2단계 총합 오차만 더 낫다
@@ -51,11 +61,14 @@ TEST_START, TEST_END = "2023-01-01", "2024-01-01"
 
 
 def build_dataset(energy_type: str, use_demand: bool) -> tuple[pd.DataFrame, list[str]]:
+    gen = load_generation_actual(energy_type)
     df = add_time_features(build_labeled_hourly(energy_type))
+    df = add_normalized_features(df, gen, load_demand_actual())
     features = list(BASE_FEATURES)
     if use_demand:
-        df = df.merge(load_demand_actual(), on="dt", how="inner")
-        features.append("demand_mw")
+        features.append("penetration")
+        if energy_type == "wind":
+            features.append("demand_mw")  # 풍력은 수요 자체도 정식 피처(05장)
     df = df.dropna(subset=features).reset_index(drop=True)
     return df, features
 
@@ -85,6 +98,8 @@ def train_one(energy_type: str, use_demand: bool) -> list[dict]:
     calib = df[(df["dt"] >= CALIB_START) & (df["dt"] < CALIB_END)]
     test = df[(df["dt"] >= TEST_START) & (df["dt"] < TEST_END)]
 
+    proxy_now = latest_capacity_proxy(load_generation_actual(energy_type))
+
     base = make_model()
     base.fit(train[features], train["is_curtailed"])
 
@@ -112,6 +127,10 @@ def train_one(energy_type: str, use_demand: bool) -> list[dict]:
             train_period=[str(train["dt"].min()), str(train["dt"].max())],
             test_period=[TEST_START, TEST_END],
             label_coverage=list(CURTAILMENT_COVERAGE[energy_type]),
+            # 서빙 시 capacity_factor의 분모로 쓰는 상수. /predict는 미래 시각을 받아
+            # 그 시점의 대리지표를 계산할 수 없으므로 학습 시점의 최신값을 고정해 쓴다.
+            # 재학습할 때마다 갱신되며, 설비가 크게 늘면 재학습이 필요하다는 신호이기도 하다.
+            capacity_proxy_mwh=proxy_now,
             input_generation="actual",  # 서비스 경로 성능은 evaluate_pipeline 참고
             test_report=report,
             served_by_predict=(method == SERVED_METHOD),
@@ -141,6 +160,7 @@ def train_one(energy_type: str, use_demand: bool) -> list[dict]:
 
 if __name__ == "__main__":
     results = (train_one("solar", use_demand=False)
+               + train_one("solar", use_demand=True)   # 침투율용 — 수요를 분모로만 사용
                + train_one("wind", use_demand=False)
-               + train_one("wind", use_demand=True))  # 정식 채택 모델 (05장)
+               + train_one("wind", use_demand=True))   # 정식 채택 모델 (05장)
     pd.DataFrame(results).to_csv(os.path.join(MODELS_DIR, "classifier_metrics.csv"), index=False)

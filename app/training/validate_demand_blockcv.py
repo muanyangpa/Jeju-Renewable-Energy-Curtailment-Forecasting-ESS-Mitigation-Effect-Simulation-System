@@ -20,7 +20,7 @@ import os
 import numpy as np
 import pandas as pd
 
-from app.data_prep import add_time_features, build_labeled_hourly, load_demand_actual
+from app.data_prep import add_normalized_features, load_generation_actual, add_time_features, build_labeled_hourly, load_demand_actual
 from app.metrics import classification_report, saturation_warning
 from app.model_io import MODELS_DIR
 from app.training.train_classifier import BASE_FEATURES, make_model
@@ -33,13 +33,15 @@ BLOCKS = [
     ("2023-01-01", "2023-07-01"),
     ("2023-07-01", "2024-01-01"),
 ]
-DEMAND_FEATURES = BASE_FEATURES + ["demand_mw"]
+# 프로덕션 분류기와 같은 구성으로 비교한다 — 수요는 자유 피처(demand_mw)로도,
+# 침투율(penetration = 발전량/수요)의 분모로도 들어간다.
+DEMAND_FEATURES = BASE_FEATURES + ["penetration", "demand_mw"]
 METRIC_KEYS = ["auc", "pr_auc", "brier", "top5_capture", "top5_precision"]
 
 
 def build_dataset() -> pd.DataFrame:
-    df = build_labeled_hourly("wind").merge(load_demand_actual(), on="dt", how="inner")
-    df = add_time_features(df)
+    df = add_time_features(build_labeled_hourly("wind"))
+    df = add_normalized_features(df, load_generation_actual("wind"), load_demand_actual())
     return df.dropna(subset=DEMAND_FEATURES).sort_values("dt").reset_index(drop=True)
 
 

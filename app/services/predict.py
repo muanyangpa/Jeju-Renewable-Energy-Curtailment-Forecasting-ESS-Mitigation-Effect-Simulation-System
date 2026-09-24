@@ -19,7 +19,7 @@ import numpy as np
 import pandas as pd
 
 from app.data_prep import add_time_features
-from app.model_io import load_artifact
+from app.model_io import converter_predict_mwh, load_artifact
 from app.schemas import EnergyType, HourlyPrediction, PredictRequest, PredictResponse
 
 ESS_WARNING = (
@@ -58,25 +58,42 @@ def predict(req: PredictRequest) -> PredictResponse:
     df = add_time_features(df)
 
     # ---- ②단계: 날씨 -> 발전량 예측치 ----
-    df["generation_mwh"] = np.clip(converter["model"].predict(df[converter["features"]]), 0, None)
+    # 태양광 컨버터는 타깃이 '이용률'이라 설비용량 대리지표를 곱해 MWh로 환산한다.
+    # 곱하는 상수는 분류기가 나눌 때 쓰는 상수와 같아야 왕복이 정확히 상쇄된다
+    # (양쪽 모두 data_prep.latest_capacity_proxy로 계산해 아티팩트에 저장).
+    df["generation_mwh"] = converter_predict_mwh(converter, df)
 
-    # ---- ③단계: 발전량 -> 출력제어 확률 (+ 풍력은 제어량 2단계 추정) ----
-    # /predict는 isotonic 보정된 분류기만 로드한다 (보정 전 모델을 서빙하는 경로는 없다).
-    # 보정 구간은 기저 학습·2023 테스트 어디에도 쓰지 않은 2022-07-01~2023-01-01이며,
-    # 아티팩트 메타데이터(calibration_period)에 기록돼 있다.
-    use_demand = energy_type == "wind" and req.demand_forecast_mw is not None
+    # ---- ③단계: 발전량 -> 정규화 피처 -> 출력제어 확률 ----
+    # /predict는 sigmoid 보정 분류기만 로드한다(보정 전 모델을 서빙하는 경로는 없다).
+    #
+    # [2026-09-25] 분류기 입력이 발전량 절대값에서 정규화 피처로 바뀌었다.
+    #   capacity_factor = 발전량 / 설비용량대리
+    #   penetration     = 발전량 / 수요
+    # 설비용량 대리지표는 미래 시각에 대해 계산할 수 없으므로 학습 시점의 최신값을
+    # 아티팩트 메타데이터(capacity_proxy_mwh)에 고정해두고 상수로 쓴다.
+    # 설비가 크게 늘면 이 상수가 실제와 벌어지므로 재학습이 필요하다.
+    use_demand = req.demand_forecast_mw is not None
+    suffix = "_demand" if use_demand else ""
+    clf_name = f"classifier_{energy_type}{suffix}_calibrated_sigmoid"
+    classifier = _load(clf_name)
+
+    proxy = (classifier.get("meta") or {}).get("capacity_proxy_mwh")
+    if not proxy:
+        raise RuntimeError(
+            f"{clf_name}: capacity_proxy_mwh 메타데이터가 없습니다 — "
+            f"`python -m app.training.train_classifier`로 재학습하세요"
+        )
+    df["capacity_factor"] = df["generation_mwh"] / float(proxy)
     if use_demand:
         df["demand_mw"] = req.demand_forecast_mw
+        df["penetration"] = df["generation_mwh"] / df["demand_mw"]
 
-    clf_name = ("classifier_wind_demand_calibrated_sigmoid" if use_demand
-                else f"classifier_{energy_type}_calibrated_sigmoid")
-    classifier = _load(clf_name)
     proba = classifier["model"].predict_proba(df[classifier["features"]])[:, 1]
 
     # 풍력 + 수요예측이면 같은 확률에 조건부 제어량을 곱해 기댓값을 만든다.
     # 두 값이 같은 확률을 쓰므로 expected / probability = 조건부 제어량이 성립한다.
     expected = [None] * 24
-    if use_demand:
+    if energy_type == "wind" and use_demand:
         stage2 = _optional("curtailment_stage2_wind")
         if stage2 is not None:
             conditional = np.clip(stage2["model"].predict(df[stage2["features"]]), 0, None)
@@ -94,12 +111,16 @@ def predict(req: PredictRequest) -> PredictResponse:
     ]
 
     note = SOLAR_NOTE if energy_type == "solar" else None
-    if energy_type == "wind" and not use_demand:
-        note = ("demand_forecast_mw가 없어 수요 미포함 모델(classifier_wind_calibrated_sigmoid)을 사용했고, "
-                "제어량 조건부 회귀는 수요 피처가 필요해 expected_curtailment_mwh를 제공하지 않습니다.")
-    elif use_demand and expected[0] is not None:
+    if not use_demand:
+        note = (f"demand_forecast_mw가 없어 침투율(발전량/수요) 미포함 모델"
+                f"({clf_name})을 사용했습니다. 정확도가 낮으므로 가능하면 수요예측을 함께 보내세요."
+                + ("" if energy_type == "solar" else
+                   " 제어량 조건부 회귀도 수요 피처가 필요해 expected_curtailment_mwh는 null입니다."))
+        if energy_type == "solar":
+            note = SOLAR_NOTE + " " + note
+    elif energy_type == "wind" and expected[0] is not None:
         note = ESS_WARNING
-    elif use_demand:
+    elif energy_type == "wind":
         note = ("조건부 회귀 아티팩트(curtailment_stage2_wind)가 없어 확률만 반환하고 "
                 "expected_curtailment_mwh는 null입니다. "
                 "`python -m app.training.train_curtailment_regressor`로 학습하세요.")

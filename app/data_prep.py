@@ -72,16 +72,150 @@ def _melt_hourly(df: pd.DataFrame, date_col: str, value_name: str) -> pd.DataFra
 # 발전량 실적 (제주 전체, 태양광/풍력)
 # ---------------------------------------------------------------------------
 
-def load_generation_actual(energy_type: str) -> pd.DataFrame:
-    """energy_type: 'solar' | 'wind' -> DataFrame[dt, generation_mwh]"""
+# 롱 포맷 지역별 데이터셋(한국전력거래소_지역별 시간별 태양광 및 풍력 발전량)의 필수 컬럼.
+# 기존 "제주지역 ... 한시간단위실적"은 1시~24시 와이드 포맷이고, 이쪽은 행 단위다.
+_LONG_GEN_COLS = ("거래일", "거래시간", "지역", "연료원")
+
+
+def _read_generation_wide(energy_type: str) -> pd.DataFrame:
+    """기존 포맷: '제주지역 태양광/풍력 한시간단위실적' (1시~24시 와이드)."""
     fname_substr = "태양광 한시간단위실적" if energy_type == "solar" else "풍력 한시간단위실적"
     path = _find(fname_substr)
     df = _read_csv_any_encoding(path)
     df.columns = [str(c).strip() for c in df.columns]
-    date_col = df.columns[0]
-    long = _melt_hourly(df, date_col, "generation_mwh")
+    long = _melt_hourly(df, df.columns[0], "generation_mwh")
     long["generation_mwh"] = pd.to_numeric(long["generation_mwh"], errors="coerce")
-    return long.dropna(subset=["generation_mwh"]).sort_values("dt").reset_index(drop=True)
+    return long.dropna(subset=["generation_mwh"])
+
+
+def _hour_to_end_of_hour(hours: pd.Series) -> tuple[pd.Series, str]:
+    """거래시간 컬럼을 이 프로젝트의 규약(구간 '끝 시각')에 맞춘 시간 오프셋으로 변환.
+
+    이 저장소의 dt는 항상 1시간 구간의 끝 시각이다(1시 = 00:00~01:00 -> 01:00).
+    공공데이터 문서에 1~24시인지 0~23시인지 명시가 없어 값 범위로 판별한다.
+      - 1~24 : 기존 파일과 같은 규약 -> 그대로 더한다
+      - 0~23 : 구간 '시작 시각' 표기로 보고 +1 시간
+    [주의] 0~23이 '끝 시각'을 뜻하는 다른 해석도 가능하다. 겹치는 구간으로 반드시
+    검증할 것 -- scripts/verify_generation_overlap.py 참고.
+    """
+    lo, hi = int(hours.min()), int(hours.max())
+    if hi == 24:
+        return hours, f"1~24시(구간 끝) 규약으로 해석 [관측 범위 {lo}~{hi}]"
+    if lo == 0:
+        return hours + 1, f"0~23시(구간 시작) 규약으로 해석해 +1시간 [관측 범위 {lo}~{hi}]"
+    return hours, f"기본(구간 끝) 규약으로 해석 [관측 범위 {lo}~{hi}]"
+
+
+def _read_generation_long(energy_type: str) -> pd.DataFrame:
+    """롱 포맷 지역별 파일들에서 제주 + 해당 연료원만 추출. 없으면 빈 DataFrame."""
+    fuel = "태양광" if energy_type == "solar" else "풍력"
+    frames = []
+    for f in sorted(os.listdir(DATA_DIR)):
+        if not f.lower().endswith(".csv"):
+            continue
+        try:
+            df = _read_csv_any_encoding(os.path.join(DATA_DIR, f), nrows=5)
+        except Exception:
+            continue
+        cols = {str(c).strip() for c in df.columns}
+        if not set(_LONG_GEN_COLS).issubset(cols):
+            continue
+        df = _read_csv_any_encoding(os.path.join(DATA_DIR, f))
+        df.columns = [str(c).strip() for c in df.columns]
+        val_col = next((c for c in df.columns if "거래량" in c or "발전량" in c), None)
+        if val_col is None:
+            continue
+        sub = df[df["지역"].astype(str).str.contains("제주", na=False)
+                 & df["연료원"].astype(str).str.contains(fuel, na=False)].copy()
+        if sub.empty:
+            continue
+        hours = pd.to_numeric(sub["거래시간"], errors="coerce")
+        sub = sub[hours.notna()]
+        hours, note = _hour_to_end_of_hour(hours.dropna().astype(int))
+        sub["dt"] = pd.to_datetime(sub["거래일"], errors="coerce") + pd.to_timedelta(hours, unit="h")
+        sub["generation_mwh"] = pd.to_numeric(sub[val_col], errors="coerce")
+        sub = sub.dropna(subset=["dt", "generation_mwh"])
+        if not sub.empty:
+            print(f"  [롱포맷] {f}: {fuel} {len(sub)}행 "
+                  f"({sub['dt'].min():%Y-%m}~{sub['dt'].max():%Y-%m}) — {note}")
+            frames.append(sub[["dt", "generation_mwh"]])
+    if not frames:
+        return pd.DataFrame(columns=["dt", "generation_mwh"])
+    return pd.concat(frames).groupby("dt", as_index=False)["generation_mwh"].sum()
+
+
+def load_generation_actual(energy_type: str) -> pd.DataFrame:
+    """energy_type: 'solar' | 'wind' -> DataFrame[dt, generation_mwh]
+
+    기존 와이드 파일을 기준으로 삼고, 롱 포맷 지역별 파일은 '기존에 없는 시각'만 덧붙인다.
+    겹치는 구간에서 기존 값을 유지하는 이유는 지금까지의 검증 결과를 재현 가능하게 두기 위함이다.
+    """
+    wide = _read_generation_wide(energy_type)
+    extra = _read_generation_long(energy_type)
+    if not extra.empty:
+        new_only = extra[~extra["dt"].isin(set(wide["dt"]))]
+        if not new_only.empty:
+            print(f"  [발전량:{energy_type}] 기존 {wide['dt'].max():%Y-%m}까지 + "
+                  f"롱포맷에서 {len(new_only)}시간 추가 (~{new_only['dt'].max():%Y-%m})")
+            wide = pd.concat([wide, new_only])
+    return wide.sort_values("dt").drop_duplicates(subset="dt").reset_index(drop=True)
+
+
+# ---------------------------------------------------------------------------
+# 설비용량 대리지표 / 정규화 피처
+# ---------------------------------------------------------------------------
+
+def capacity_proxy(gen: pd.DataFrame, window_days: int = 365, q: float = 0.99,
+                   min_days: int = 60) -> pd.Series:
+    """발전량 이력만으로 만든 설비용량 대리지표 (공개 설비용량 시계열이 없어서).
+
+    과거 window_days 구간의 q분위수를 쓴다. 태양광은 절반이 야간(0)이라 99분위가
+    사실상 '맑은 날 정오 최대 출력'에 해당하고, 이는 설비용량에 비례한다.
+
+    [인과성] rolling 후 shift(1)로 현재 시각을 제외한다. 현재 발전량이 자기 분모에
+    들어가면 미래 정보가 새고, 정규화된 값이 인위적으로 1 근처에 묶인다.
+
+    [콜드스타트] 발전량 실적은 2019-12부터 있고 라벨은 2021-01부터라, 라벨 구간
+    시작 시점에는 이미 1년 이상의 이력이 쌓여 있다. 따라서 학습 데이터 손실은 없다.
+    """
+    s = gen.set_index("dt")["generation_mwh"].sort_index()
+    prox = s.rolling(f"{window_days}D", min_periods=24 * min_days).quantile(q).shift(1)
+    return prox.ffill()
+
+
+def latest_capacity_proxy(gen: pd.DataFrame) -> float:
+    """서빙에서 쓰는 '고정' 설비용량 대리지표 = 전체 이력의 마지막 유효값.
+
+    컨버터(이용률 -> MWh 환산)와 분류기(MWh -> 이용률)가 반드시 같은 상수를 써야 한다.
+    다르면 왕복에서 비율만큼 왜곡이 남는다(예: 242 vs 232이면 capacity_factor가 4% 부풀려짐).
+    """
+    return round(float(capacity_proxy(gen).dropna().iloc[-1]), 2)
+
+
+def add_normalized_features(df: pd.DataFrame, gen_full: pd.DataFrame,
+                            demand: pd.DataFrame | None = None) -> pd.DataFrame:
+    """capacity_factor(이용률)와 penetration(수요 대비 침투율)을 추가한다.
+
+    왜 둘 다인가:
+      - capacity_factor = 발전량 / 설비용량대리 -> '날씨가 얼마나 좋았나'. 증설이 있어도
+        범위가 [0, 1] 근처로 안정돼 학습 구간 밖으로 나가지 않는다.
+      - penetration = 발전량 / 수요 -> '수요 대비 잉여 압력'. 출력제어를 실제로 일으키는
+        물리량이다. 증설과 함께 커지지만, 그 증가는 노이즈가 아니라 신호다.
+      이용률만 쓰면 절대 규모 정보가 사라져 제어 요인을 잃고, 절대 발전량만 쓰면
+      증설로 학습 범위를 벗어나 RandomForest가 경계에서 포화된다.
+
+    gen_full: 대리지표 계산용 '전체 기간' 발전량(라벨 구간으로 자르기 전).
+    """
+    out = df.copy()
+    prox = capacity_proxy(gen_full)
+    out["capacity_proxy_mwh"] = out["dt"].map(prox)
+    out["capacity_factor"] = (out["generation_mwh"] / out["capacity_proxy_mwh"]).replace(
+        [np.inf, -np.inf], np.nan)
+    if demand is not None:
+        out = out.merge(demand, on="dt", how="left")
+        out["penetration"] = (out["generation_mwh"] / out["demand_mw"]).replace(
+            [np.inf, -np.inf], np.nan)
+    return out
 
 
 # ---------------------------------------------------------------------------

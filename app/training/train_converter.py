@@ -17,11 +17,21 @@ import pandas as pd
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.metrics import mean_absolute_error
 
-from app.data_prep import add_time_features, load_asos, load_asos_multi, load_generation_actual
+from app.data_prep import (add_time_features, capacity_proxy, latest_capacity_proxy, load_asos,
+                           load_asos_multi, load_generation_actual)
 from app.model_io import MODELS_DIR, save_artifact
 
 SOLAR_FEATURES = ["solar_rad", "temp", "cloud", "hour_sin", "hour_cos", "month_sin", "month_cos"]
 WIND_FEATURES = ["wind_speed", "hour_sin", "hour_cos", "month_sin", "month_cos"]
+
+# [2026-09-25] 발전원별로 타깃을 다르게 쓴다 — 원인이 다르므로 처방도 다르다.
+#   태양광: 설비 증설로 타깃이 해마다 커져 RandomForest가 학습 최대(269MWh)를 못 넘었다
+#           (2023 예측 최대 251MWh, 실측 336MWh). 이용률을 타깃으로 두고 예측 후 되곱하면
+#           외삽이 가능해진다. NMAE 29.63% -> 25.44%(고정 대리지표 기준).
+#   풍력  : 증설이 거의 없어 2023 실측이 학습 최대를 넘는 시간이 0.03%뿐이다.
+#           정규화해도 42.04% -> 42.06%로 변화가 없어 현행 유지. 풍력 오차의 원인은
+#           외삽이 아니라 관측지점과 풍력단지의 위치 불일치이고, 3지점 평균으로 이미 대응했다.
+NORMALIZED_TARGET = {"solar": True, "wind": False}
 
 
 def _nmae(y_true: np.ndarray, y_pred: np.ndarray) -> float:
@@ -43,32 +53,55 @@ def train_one(energy_type: str) -> dict:
     weather = add_time_features(weather)
     gen = load_generation_actual(energy_type)
 
-    df = weather.merge(gen, on="dt", how="inner").dropna()
+    df = weather.merge(gen, on="dt", how="inner")
     features = SOLAR_FEATURES if energy_type == "solar" else WIND_FEATURES
+    normalized = NORMALIZED_TARGET[energy_type]
+
+    if normalized:
+        # 타깃 정규화용 대리지표는 '시점별 인과적' 값을 쓴다(과거만 사용).
+        df["capacity_proxy_mwh"] = df["dt"].map(capacity_proxy(gen))
+        df = df.dropna(subset=["capacity_proxy_mwh"])
+        df["target"] = df["generation_mwh"] / df["capacity_proxy_mwh"]
+    else:
+        df["target"] = df["generation_mwh"]
+    df = df.dropna(subset=features + ["target", "generation_mwh"])
 
     # 리키지-프리: 2023년을 테스트로, 그 이전을 학습으로 (계획서 전체와 동일한 시간분할 원칙)
     train = df[df["dt"] < "2023-01-01"]
     test = df[df["dt"] >= "2023-01-01"]
 
     model = RandomForestRegressor(n_estimators=300, max_depth=12, random_state=42, n_jobs=-1)
-    model.fit(train[features], train["generation_mwh"])
+    model.fit(train[features], train["target"])
 
-    pred = model.predict(test[features])
+    # 서빙용 고정 대리지표. 분류기와 같은 상수를 써야 MWh<->이용률 왕복이 상쇄된다.
+    serve_proxy = latest_capacity_proxy(gen) if normalized else None
+    # 평가는 '학습 시점에 알 수 있었던' 값으로 해야 정직하다(전체 이력의 마지막 값을 쓰면
+    # 2023 테스트에 미래 정보가 들어간다).
+    eval_proxy = float(train["capacity_proxy_mwh"].iloc[-1]) if normalized else None
+
+    raw = np.clip(model.predict(test[features]), 0, None)
+    pred = raw * eval_proxy if normalized else raw
     corr = np.corrcoef(test["generation_mwh"], pred)[0, 1]
     nmae = _nmae(test["generation_mwh"].to_numpy(), pred)
 
     out_path = save_artifact(
         f"converter_{energy_type}", model, features,
         station=station,
+        target="capacity_factor" if normalized else "generation_mwh",
+        capacity_proxy_mwh=serve_proxy,      # 서빙에서 곱하는 상수 (정규화 모델만)
+        eval_capacity_proxy_mwh=eval_proxy,  # 아래 지표를 낼 때 쓴 값
         train_period=[str(train["dt"].min()), str(train["dt"].max())],
         test_period=["2023-01-01", str(test["dt"].max())],
         test_corr=round(float(corr), 4), test_nmae_pct=round(float(nmae), 2),
     )
 
-    metrics = {"energy_type": energy_type, "station": station, "corr": round(float(corr), 4), "nmae_pct": round(float(nmae), 2),
+    metrics = {"energy_type": energy_type, "station": station,
+               "target": "capacity_factor" if normalized else "generation_mwh",
+               "corr": round(float(corr), 4), "nmae_pct": round(float(nmae), 2),
                "n_train": len(train), "n_test": len(test)}
+    extra = f" [이용률 타깃, 서빙 대리지표={serve_proxy}MWh]" if normalized else ""
     print(f"[converter:{energy_type}] corr={metrics['corr']} NMAE={metrics['nmae_pct']}% "
-          f"(train={metrics['n_train']}, test={metrics['n_test']}) -> {out_path}")
+          f"(train={metrics['n_train']}, test={metrics['n_test']}){extra} -> {out_path}")
     return metrics
 
 
