@@ -10,7 +10,7 @@ from __future__ import annotations
 import pandas as pd
 
 from app.data_prep import (CURTAILMENT_COVERAGE, DATA_DIR, load_asos, load_curtailment,
-                           load_demand_actual, load_generation_actual)
+                           load_demand_actual, load_generation_actual, load_smp_dayahead)
 
 SOURCES = [
     ("발전량 태양광", lambda: load_generation_actual("solar")),
@@ -21,6 +21,7 @@ SOURCES = [
     ("ASOS 184(제주)", lambda: load_asos("184")),
     ("ASOS 185(고산)", lambda: load_asos("185")),
     ("ASOS 188(성산)", lambda: load_asos("188")),
+    ("하루전 SMP(대리라벨)", load_smp_dayahead),
 ]
 
 
@@ -50,6 +51,9 @@ def main() -> None:
         print(f"  {k}: {v[0]} ~ {v[1]}")
     print("  ※ 2024-06-01부터 제주는 재생에너지 입찰제도로 전환돼 라벨 정의가 다르다.")
     print("     그 경계를 넘겨 학습하면 서로 다른 제도의 데이터가 섞인다(README 참고).")
+    print("     엄밀한 경계는 2024-04-01(최소발전용량 하향)이며 위 구간은 그보다 앞선다.")
+    print("\n신제도 구간(2024-06~)은 하루전 SMP <= 0을 대리 라벨로 평가한다:")
+    print("  python -m app.training.evaluate_new_regime")
 
 
 if __name__ == "__main__":

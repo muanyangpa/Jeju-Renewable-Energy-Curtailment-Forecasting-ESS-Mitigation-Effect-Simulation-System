@@ -207,6 +207,58 @@ def load_generation_actual(energy_type: str, source: str = "all") -> pd.DataFram
 
 
 # ---------------------------------------------------------------------------
+# 제주 하루전 SMP — 신제도 구간의 대리 라벨
+# ---------------------------------------------------------------------------
+# 2024-06 재생에너지 입찰제도 전환 이후 제어 실적이 공개되지 않는다. 대신 재생에너지 입찰
+# 상한이 0원/kWh이므로 SMP <= 0은 '재생에너지가 낙찰되지 못한 시간' = 시장 기반 출력제어의
+# 대리 지표가 된다. 구 라벨과 겹치는 2024-03~05 구간에서 검증한 결과
+#   풍력   정밀도 0.665 / 재현율 0.626 / F1 0.645
+#   태양광 정밀도 0.526 / 재현율 0.696 / F1 0.599
+# 임계값을 5원·20원으로 올려도 F1이 거의 변하지 않아(0.649 / 0.604) 0이 자연스러운 경계다.
+#
+# [반드시 '하루전' 계열을 쓸 것] 전일 공개되므로 하루 전 예측 시점에 알 수 있다.
+# EPSIS '시간별 SMP'(실시간·정산 계열)는 사후 확정값이고 하루전과 5.6% 불일치하며
+# 음수가 76건뿐이다(하루전은 196건). 실시간 계열을 라벨로 쓰면 미래 정보가 새어 들어간다.
+SMP_SURPLUS_THRESHOLD = 0.0
+
+
+def load_smp_dayahead() -> pd.DataFrame:
+    """전력거래소 제주시범사업 하루전 SMP -> DataFrame[dt, smp] (원/kWh).
+
+    파일: data/raw/KPX_제주_하루전SMP_*.xlsx (scripts/fetch_smp.py로 내려받음)
+    포맷: 1행 제목, 2행 헤더(구분 · 1h~24h · 최대 · 최소 · 평균), 이후 날짜별 행.
+    """
+    files = sorted(f for f in os.listdir(DATA_DIR) if "제주_하루전SMP" in f and f.endswith(".xlsx"))
+    if not files:
+        raise FileNotFoundError(
+            f"{DATA_DIR}에 KPX_제주_하루전SMP_*.xlsx가 없습니다 — "
+            f"`python -m scripts.fetch_smp`로 내려받으세요"
+        )
+    frames = []
+    for f in files:
+        d = pd.read_excel(os.path.join(DATA_DIR, f), header=1)
+        d = d[pd.to_numeric(d["구분"], errors="coerce").notna()]
+        base = pd.to_datetime(d["구분"].astype(int).astype(str), format="%Y%m%d")
+        for h in range(1, 25):
+            col = f"{h}h"
+            if col not in d.columns:
+                continue
+            frames.append(pd.DataFrame({
+                "dt": base + pd.to_timedelta(h, unit="h"),
+                "smp": pd.to_numeric(d[col], errors="coerce"),
+            }))
+    out = pd.concat(frames).dropna(subset=["smp"])
+    return out.sort_values("dt").drop_duplicates(subset="dt").reset_index(drop=True)
+
+
+def load_surplus_proxy_label() -> pd.DataFrame:
+    """DataFrame[dt, smp, is_surplus] — 신제도 구간의 대리 라벨."""
+    d = load_smp_dayahead()
+    d["is_surplus"] = (d["smp"] <= SMP_SURPLUS_THRESHOLD).astype(int)
+    return d
+
+
+# ---------------------------------------------------------------------------
 # 설비용량 대리지표 / 정규화 피처
 # ---------------------------------------------------------------------------
 
