@@ -29,7 +29,7 @@ ESS_WARNING = (
 )
 
 SOLAR_NOTE = (
-    "태양광은 전력거래소가 출력제어 제어량(MWh)을 공식적으로 산정하지 않아(계획서 07장) "
+    "태양광 출력제어량(MWh)은 공개되지 않아(연 단위 값만 의원실 자료요청으로 확인됨) "
     "expected_curtailment_mwh를 제공하지 않습니다. curtailment_probability(발생 확률)만 사용하세요."
 )
 
