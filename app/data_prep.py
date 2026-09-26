@@ -315,6 +315,54 @@ def add_normalized_features(df: pd.DataFrame, gen_full: pd.DataFrame,
     return out
 
 
+OTHER_SOURCE = {"wind": "solar", "solar": "wind"}
+
+
+def add_cross_source_penetration(df: pd.DataFrame, energy_type: str,
+                                 other_gen: pd.DataFrame | None = None) -> pd.DataFrame:
+    """타 발전원을 합친 계통 전체 침투율 total_penetration을 추가한다.
+
+    [왜 필요한가 — 2026-09-26]
+    출력제어는 발전원별로 결정되지 않는다. 계통평가세부운영규정 제8.3.1조의
+        출력제어요구량 = P재생E전망 - (P수요예측 - P중앙급전_최소출력 - P연계선_최소출력)
+    에서 P재생E전망은 재생에너지 '합계' 전망이다. 전력시장 제도개선 제주 시범사업
+    운영규칙도 급전불가 재생에너지 발전계획을 Max{거래소예측 - (급전가능재생E입찰 +
+    자체발전계획량), 0}로 합계 기준으로 모델링한다.
+
+    이것이 데이터에 그대로 찍혀 있다. 2023년 풍력 제어 563시간의 평균 발전량은
+      풍력   제어시 50.7 / 비제어시 58.6 MWh  <- 제어될 때 오히려 낮다
+      태양광 제어시 235.2 / 비제어시 43.3 MWh <- 5.4배
+    풍력 이용률 단독의 AUC는 0.476으로 무작위보다 나쁘다. 즉 풍력 제어를 일으키는 것은
+    풍력이 아니라 태양광이다. 문헌도 같은 말을 한다 — 에너지경제연구원 이슈페이퍼 23-09은
+    "태양광 및 풍력 발전량의 과잉공급으로 인해 풍력의 출력제한 횟수가 획기적으로 증가",
+    전력거래소 공저 논문(Journal of Climate Change Research 13(1))은 "높은 용량의
+    태양광과 풍력발전이 집중적으로 발생될 경우 수요보다 재생에너지 발전이 더 많은
+    과잉발전이 발생하여 재생에너지 출력을 제한"이라고 적었다.
+
+    other_gen: 타 발전원 발전량 DataFrame[dt, other_generation_mwh]. 생략하면 실측을 쓴다.
+      서빙 경로는 타 발전원도 컨버터 예측값이므로, 학습에도 컨버터 예측을 넣은 변형을 함께
+      만들어 서빙 조건과 맞는 쪽을 배포한다(stage2가 trained_on=converter를 고르는 것과 같은 이유).
+      실측으로 학습하고 컨버터로 서빙하면 total_penetration의 수준이 어긋나 순위는 유지되지만
+      확률의 크기가 눌린다 — 2023 컨버터 입력에서 Sum(p)가 718에서 398로 떨어지는 것이 그 증상이다.
+
+    [주의] 분모인 demand_mw 자체도 태양광에 눌려 있다. 같은 이슈페이퍼가 지적한
+    '자가용 태양광 증가로 최소부하가 낮아지는 디커플링'이며, 관측 수요는 계량되지 않는
+    자가용 발전을 이미 차감한 값이다. 따라서 total_penetration의 분자·분모가 독립이
+    아니지만, 그 상관은 잉여 압력을 '강화하는' 방향이라 신호로 쓸 수 있다.
+    """
+    if other_gen is None:
+        other_gen = load_generation_actual(OTHER_SOURCE[energy_type])[["dt", "generation_mwh"]].rename(
+            columns={"generation_mwh": "other_generation_mwh"})
+    out = df.merge(other_gen[["dt", "other_generation_mwh"]], on="dt", how="left")
+    if "demand_mw" not in out.columns:
+        raise ValueError("add_cross_source_penetration은 demand_mw가 먼저 붙어 있어야 합니다 "
+                         "(add_normalized_features에 demand를 넘기세요)")
+    out["total_penetration"] = (
+        (out["generation_mwh"] + out["other_generation_mwh"]) / out["demand_mw"]
+    ).replace([np.inf, -np.inf], np.nan)
+    return out
+
+
 # ---------------------------------------------------------------------------
 # 출력제어 이력 (발생여부 + 풍력만 제어량 MWh)
 # ---------------------------------------------------------------------------

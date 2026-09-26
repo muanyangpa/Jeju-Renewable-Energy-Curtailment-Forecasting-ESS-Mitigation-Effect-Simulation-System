@@ -18,7 +18,7 @@ from functools import lru_cache
 import numpy as np
 import pandas as pd
 
-from app.data_prep import add_time_features
+from app.data_prep import OTHER_SOURCE, add_time_features
 from app.model_io import converter_predict_mwh, load_artifact
 from app.schemas import EnergyType, HourlyPrediction, PredictRequest, PredictResponse
 
@@ -26,6 +26,23 @@ ESS_WARNING = (
     "expected_curtailment_mwh = curtailment_probability x E[제어량|제어 발생]로 계산한 '기댓값'입니다. "
     "총합 추정에는 쓸 수 있으나 개별 시간의 제어량 크기가 아니므로 /ess/simulate의 "
     "hourly_curtailment_mwh로 넣지 마세요 — 흡수율이 크게 과대평가됩니다(README '알려진 한계' 참고)."
+)
+
+# 타 발전원 발전량을 '컨버터 예측'으로 학습한 변형(_crossp)을 서빙한다. 실측으로 학습한
+# 변형(_cross)은 순위는 비슷하지만(서비스경로 PR-AUC 0.855 vs 0.853) 서빙 입력에서 확률의
+# 크기가 눌린다 — 2023 컨버터 입력 Sum(p)가 398(실제 563시간) vs _crossp 518.
+# expected_curtailment_mwh 총합이 Sum(p)에 비례하므로 이 차이가 그대로 총합 오차가 된다.
+CROSS_ARTIFACT = "classifier_wind_demand_crossp_calibrated_sigmoid"
+
+CROSS_NOTE = (
+    "태양광 기상값(solar_rad·temp·cloud)이 함께 와서 계통 전체 침투율 포함 모델을 사용했습니다 — "
+    "출력제어는 재생에너지 합계 기준으로 결정되므로 풍력만 보는 모델보다 정확합니다"
+    "(2023 테스트 PR-AUC 0.717 -> 0.805)."
+)
+
+CROSS_HINT = (
+    " 태양광 기상값(solar_rad·temp·cloud)을 함께 보내면 계통 전체 침투율 포함 모델로 전환돼 "
+    "정확도가 더 올라갑니다(PR-AUC 0.717 -> 0.805)."
 )
 
 SOLAR_NOTE = (
@@ -73,7 +90,28 @@ def predict(req: PredictRequest) -> PredictResponse:
     # 아티팩트 메타데이터(capacity_proxy_mwh)에 고정해두고 상수로 쓴다.
     # 설비가 크게 늘면 이 상수가 실제와 벌어지므로 재학습이 필요하다.
     use_demand = req.demand_forecast_mw is not None
-    suffix = "_demand" if use_demand else ""
+
+    # [2026-09-26] 풍력은 '계통 전체 침투율' 모델로 자동 전환한다.
+    # 출력제어는 발전원별이 아니라 재생에너지 합계 기준으로 결정되므로(계통평가세부운영규정
+    # 제8.3.1조의 P재생E전망), 풍력 제어를 예측하려면 태양광을 봐야 한다. 2023년 풍력 제어
+    # 563시간의 평균 태양광 발전량은 235.2MWh(비제어시 43.3)인데 풍력은 50.7(비제어시 58.6)로
+    # 오히려 낮다 — 풍력 이용률 단독의 AUC는 0.476으로 무작위보다 나쁘다.
+    #
+    # 태양광 발전량은 같은 요청의 태양광 기상값을 태양광 컨버터에 넣어 얻는다. 새 입력을
+    # 요구하지 않고 기존 아티팩트를 재사용하는 경로다. 기상값이 없으면 기존 모델로 되돌아간다
+    # (demand_forecast_mw의 자동 전환과 같은 방식).
+    #
+    # 태양광에는 적용하지 않는다. 같은 실험에서 태양광은 top5가 0.8475 -> 0.8333으로 나빠졌다 —
+    # 제주 잉여의 주역이 태양광 자신이라 풍력을 더해도 정보가 늘지 않는다. 비대칭이 정상이다.
+    solar_fields = ("solar_rad", "temp", "cloud")
+    use_cross = (
+        energy_type == "wind" and use_demand
+        and all(df[f].notna().all() for f in solar_fields if f in df.columns)
+        and all(f in df.columns for f in solar_fields)
+        and _optional(CROSS_ARTIFACT) is not None
+    )
+
+    suffix = ("_demand" if use_demand else "") + ("_crossp" if use_cross else "")
     clf_name = f"classifier_{energy_type}{suffix}_calibrated_sigmoid"
     classifier = _load(clf_name)
 
@@ -87,6 +125,13 @@ def predict(req: PredictRequest) -> PredictResponse:
     if use_demand:
         df["demand_mw"] = req.demand_forecast_mw
         df["penetration"] = df["generation_mwh"] / df["demand_mw"]
+    if use_cross:
+        # 타 발전원 컨버터를 같은 기상값으로 돌린다. 태양광 컨버터는 이용률 타깃이라
+        # converter_predict_mwh가 자기 아티팩트의 capacity_proxy_mwh로 MWh로 환산한다.
+        other = _load(f"converter_{OTHER_SOURCE[energy_type]}")
+        df["other_generation_mwh"] = converter_predict_mwh(other, df)
+        df["total_penetration"] = (
+            (df["generation_mwh"] + df["other_generation_mwh"]) / df["demand_mw"])
 
     proba = classifier["model"].predict_proba(df[classifier["features"]])[:, 1]
 
@@ -119,7 +164,7 @@ def predict(req: PredictRequest) -> PredictResponse:
         if energy_type == "solar":
             note = SOLAR_NOTE + " " + note
     elif energy_type == "wind" and expected[0] is not None:
-        note = ESS_WARNING
+        note = (CROSS_NOTE + " " + ESS_WARNING) if use_cross else (ESS_WARNING + CROSS_HINT)
     elif energy_type == "wind":
         note = ("조건부 회귀 아티팩트(curtailment_stage2_wind)가 없어 확률만 반환하고 "
                 "expected_curtailment_mwh는 null입니다. "

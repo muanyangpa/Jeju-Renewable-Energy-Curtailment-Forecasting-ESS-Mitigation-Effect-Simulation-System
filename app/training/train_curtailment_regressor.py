@@ -36,8 +36,9 @@ import pandas as pd
 from sklearn.ensemble import HistGradientBoostingRegressor, RandomForestRegressor
 from sklearn.metrics import mean_absolute_error, mean_pinball_loss
 
-from app.data_prep import (add_normalized_features, add_time_features, build_labeled_hourly,
-                           load_asos_multi, load_demand_actual, load_generation_actual)
+from app.data_prep import (add_cross_source_penetration, add_normalized_features,
+                           add_time_features, build_labeled_hourly, load_asos_multi,
+                           load_demand_actual, load_generation_actual)
 from app.metrics import classification_report
 from app.model_io import MODELS_DIR, converter_predict_mwh, load_artifact, save_artifact
 from app.training.train_classifier import SERVED_METHOD, build_dataset as _clf_dataset, calibrate, make_model
@@ -75,14 +76,27 @@ def build_dataset() -> pd.DataFrame:
     # stage1(보정 분류기)이 capacity_factor·penetration을 쓰므로 여기서도 같이 만들어 둔다
     df = add_normalized_features(df, gen, load_demand_actual())
 
+    # 계통 전체 침투율 — stage1이 total_penetration을 쓰므로 실측 태양광을 붙인다
+    df = add_cross_source_penetration(df, "wind")
+
     converter = load_artifact("converter_wind")
     weather = add_time_features(load_asos_multi(("184", "185", "188")))
     # 컨버터 피처는 날씨쪽 컬럼이므로 weather에서 계산한 뒤 dt로 붙인다.
     weather = weather.dropna(subset=converter["features"]).copy()
     weather["generation_pred"] = converter_predict_mwh(converter, weather)
-    df = df.merge(weather[["dt", "generation_pred"]], on="dt", how="inner")
+    cols = ["dt", "generation_pred"]
 
-    return df.dropna(subset=FEATURES + ["curtailment_mwh", "generation_pred", "capacity_factor"]).sort_values("dt").reset_index(drop=True)
+    # 서빙 경로는 태양광도 컨버터 예측값을 쓴다 — 실측 태양광을 섞으면 평가가 낙관적으로 오염된다.
+    solar_conv = load_artifact("converter_solar")
+    if set(solar_conv["features"]).issubset(weather.columns):
+        w2 = weather.dropna(subset=solar_conv["features"]).copy()
+        w2["solar_pred"] = converter_predict_mwh(solar_conv, w2)
+        weather = weather.merge(w2[["dt", "solar_pred"]], on="dt", how="left")
+        cols.append("solar_pred")
+    df = df.merge(weather[cols], on="dt", how="inner")
+
+    need = FEATURES + ["curtailment_mwh", "generation_pred", "capacity_factor", "total_penetration"]
+    return df.dropna(subset=need).sort_values("dt").reset_index(drop=True)
 
 
 def _with_gen(df: pd.DataFrame, gen_col: str) -> pd.DataFrame:
@@ -97,6 +111,12 @@ def _with_gen(df: pd.DataFrame, gen_col: str) -> pd.DataFrame:
         out["capacity_factor"] = out["generation_mwh"] / out["capacity_proxy_mwh"]
     if "demand_mw" in out.columns:
         out["penetration"] = out["generation_mwh"] / out["demand_mw"]
+        # 타 발전원도 같은 성격의 값을 써야 한다 — 실측 발전량이면 실측 태양광,
+        # 컨버터 예측이면 컨버터 예측 태양광. 섞으면 서빙 조건과 달라진다.
+        other = "solar_pred" if (gen_col == "generation_pred" and "solar_pred" in out.columns) \
+            else "other_generation_mwh"
+        if other in out.columns:
+            out["total_penetration"] = (out["generation_mwh"] + out[other]) / out["demand_mw"]
     return out
 
 
@@ -105,7 +125,10 @@ def _with_gen(df: pd.DataFrame, gen_col: str) -> pd.DataFrame:
 #    (/predict가 서빙하는 확률과 동일한 모델이어야 expected = probability x 조건부가 성립한다)
 # ---------------------------------------------------------------------------
 
-STAGE1_NAME = "classifier_wind_demand_calibrated_sigmoid"
+# [2026-09-26] 계통 전체 침투율 포함 모델로 교체. /predict가 태양광 기상값이 오면 이 모델을
+# 서빙하므로 expected = probability x 조건부의 probability도 같은 모델이어야 한다.
+# 2023 테스트 PR-AUC 0.717 -> 0.805.
+STAGE1_NAME = "classifier_wind_demand_crossp_calibrated_sigmoid"
 
 
 def load_stage1() -> dict:

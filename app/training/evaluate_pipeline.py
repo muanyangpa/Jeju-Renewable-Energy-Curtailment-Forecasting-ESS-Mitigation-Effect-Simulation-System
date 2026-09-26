@@ -22,7 +22,8 @@ import os
 import numpy as np
 import pandas as pd
 
-from app.data_prep import (add_normalized_features, add_time_features, build_labeled_hourly,
+from app.data_prep import (OTHER_SOURCE, add_cross_source_penetration,
+                           add_normalized_features, add_time_features, build_labeled_hourly,
                            load_asos, load_asos_multi, load_demand_actual, load_generation_actual)
 from app.metrics import classification_report, saturation_warning
 from app.model_io import MODELS_DIR, converter_predict_mwh, load_artifact
@@ -35,20 +36,34 @@ def _weather(energy_type: str) -> pd.DataFrame:
     return add_time_features(w)
 
 
-def evaluate(energy_type: str, use_demand: bool) -> list[dict]:
+def evaluate(energy_type: str, use_demand: bool, cross: str | None = None) -> list[dict]:
+    """cross: None | "actual"(_cross 아티팩트) | "converter"(_crossp 아티팩트)."""
+    use_cross = cross is not None
     converter = load_artifact(f"converter_{energy_type}")
     # /predict가 서빙하는 것은 보정 모델이므로 서비스 경로 평가도 보정 모델로 한다.
-    clf_name = f"classifier_{energy_type}" + ("_demand" if use_demand else "") + "_calibrated_sigmoid"
+    clf_name = (f"classifier_{energy_type}" + ("_demand" if use_demand else "")
+                + {None: "", "actual": "_cross", "converter": "_crossp"}[cross]
+                + "_calibrated_sigmoid")
     classifier = load_artifact(clf_name)
 
     labeled = build_labeled_hourly(energy_type)
     labeled = add_normalized_features(labeled, load_generation_actual(energy_type), load_demand_actual())
+    if use_cross:
+        labeled = add_cross_source_penetration(labeled, energy_type)
     labeled = labeled[(labeled["dt"] >= TEST_START) & (labeled["dt"] < TEST_END)]
     weather = _weather(energy_type)
     df = labeled.merge(weather, on="dt", how="inner")
     df = df.dropna(subset=converter["features"] + ["generation_mwh"]).reset_index(drop=True)
 
     df["generation_pred"] = converter_predict_mwh(converter, df)
+    if use_cross:
+        # 서비스 경로는 타 발전원도 컨버터 예측을 쓴다 — 실측 태양광을 넣으면 낙관적으로 오염된다.
+        other_conv = load_artifact(f"converter_{OTHER_SOURCE[energy_type]}")
+        missing = [c for c in other_conv["features"] if c not in df.columns]
+        if missing:
+            raise RuntimeError(f"{clf_name} 서비스 경로 평가에 필요한 기상 컬럼이 없습니다: {missing}")
+        df = df.dropna(subset=other_conv["features"]).reset_index(drop=True)
+        df["other_generation_pred"] = converter_predict_mwh(other_conv, df)
 
     rows = []
     for input_name, gen_col in (("actual_generation", "generation_mwh"), ("converter_generation", "generation_pred")):
@@ -57,9 +72,16 @@ def evaluate(energy_type: str, use_demand: bool) -> list[dict]:
         x["capacity_factor"] = x["generation_mwh"] / x["capacity_proxy_mwh"]
         if "demand_mw" in x.columns:
             x["penetration"] = x["generation_mwh"] / x["demand_mw"]
+            if use_cross:
+                other_col = ("other_generation_pred" if gen_col == "generation_pred"
+                             else "other_generation_mwh")
+                x["total_penetration"] = (x["generation_mwh"] + x[other_col]) / x["demand_mw"]
         proba = classifier["model"].predict_proba(x[classifier["features"]])[:, 1]
         rep = classification_report(df["is_curtailed"].to_numpy(), proba)
-        rows.append({"model": clf_name, "input": input_name, **rep})
+        # Sum(p)를 함께 남긴다. expected_curtailment_mwh 총합이 이 값에 비례하므로,
+        # 순위 지표가 좋아도 Sum(p)가 실제 제어 시간 수에서 멀어지면 총합 추정이 무너진다.
+        rows.append({"model": clf_name, "input": input_name,
+                     "sum_proba": round(float(proba.sum()), 1), **rep})
         warn = saturation_warning(rep)
         if warn:
             print(f"  ⚠ [{clf_name} / {input_name}] {warn}")
@@ -77,7 +99,11 @@ def evaluate(energy_type: str, use_demand: bool) -> list[dict]:
 
 if __name__ == "__main__":
     results = (evaluate("solar", False) + evaluate("solar", True)
-               + evaluate("wind", False) + evaluate("wind", True))
+               + evaluate("wind", False) + evaluate("wind", True)
+               # 계통 전체 침투율 모델 — 풍력 서빙 경로에서 태양광 기상값이 오면 이 모델이 쓰인다.
+               # 여기서는 태양광 발전량도 컨버터 예측값이므로 오차가 두 번 얹힌다.
+               + evaluate("wind", True, cross="actual")
+               + evaluate("wind", True, cross="converter"))
     out = os.path.join(MODELS_DIR, "pipeline_eval_metrics.csv")
     pd.DataFrame(results).to_csv(out, index=False)
     print(f"\n저장: {out}")

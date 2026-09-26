@@ -41,6 +41,7 @@ class EssSimulationResult:
     usable_capacity_mwh: float | None = None
     hours_full: int | None = None
     annual_cycles: float | None = None
+    delivered_mwh: float | None = None  # 계통에 실제로 되팔린 양 = 흡수량 x 왕복효율
 
     def to_dict(self) -> dict:
         d = {
@@ -57,6 +58,7 @@ class EssSimulationResult:
                 "usable_capacity_mwh": round(self.usable_capacity_mwh, 1),
                 "hours_full": self.hours_full,
                 "annual_cycles": round(self.annual_cycles, 1),
+                "delivered_mwh": round(self.delivered_mwh, 1),
             })
         return d
 
@@ -93,6 +95,61 @@ def simulate_hourly_capped(hourly_curtailment_mwh: list[float], rated_power_mw: 
         total_curtailment_mwh=total_curt, total_absorbed_mwh=total_abs,
         absorption_rate=rate, hourly=hourly,
     )
+
+
+# 2023년 제주 평균 SMP(EPSIS 연평균). 충전 시점 가격은 별도로 둔다 — 아래 참고.
+SMP_2023_AVG_KRW_PER_KWH = 172.5
+# 하루전 SMP(제주시범사업, 2024-03~2026-09) 기준 저녁 18~22시 평균은 전체 평균의 1.1449배다.
+# 2023년의 시간별 하루전 계열은 존재하지 않으므로 이 비율로 환산해 방전 시점 가격을 만든다.
+EVENING_SMP_RATIO = 1.1449
+# 제주 용량요금 단가. 본 계산에는 포함하지 않는다(아래 주석 참고).
+JEJU_CAPACITY_PAYMENT_KRW_PER_KWH = 22.05
+
+
+def arbitrage_value_krw(result: EssSimulationResult,
+                        discharge_price_krw_per_kwh: float | None = None,
+                        charge_price_krw_per_kwh: float = 0.0) -> dict:
+    """ESS가 제어량을 흡수해서 얻는 가치 — 차익거래(load shifting) 기준.
+
+    [왜 '흡수량 x 연평균 SMP'가 아닌가]
+    두 가지가 빠진다. 첫째, 흡수량은 충전측 양이고 왕복효율만큼 손실되므로 계통에 되팔리는
+    것은 흡수량 x 왕복효율이다. 둘째, 충전과 방전의 가격이 다르다 — 이 프로젝트 자신의
+    발견대로 제어가 일어나는 시간의 하루전 SMP는 0 이하이고(대리 라벨의 전제), 방전은
+    저녁이라 가격이 더 높다.
+
+    [문헌 근거] 전력거래소 공저 논문(Journal of Climate Change Research 13(1), 전우영·김진이·
+    이성우)은 ESS 편익을 네 가지로 나눈다 — ①차익거래 수익(SMP 낮을 때 충전·높을 때 방전,
+    "출력제한이 발생할 경우 SMP는 0원 혹은 육지 SMP가 적용되기 때문에 차익거래를 최적으로
+    추구하다보면 출력제한은 자연스럽게 최소화된다"), ②용량요금(제주 22.05원/kWh),
+    ③주파수제어 예비력 용량가치, ④실제 주파수제어 정산금. 왕복효율(Roundtrip Efficiency)도
+    그 최적화 모형의 명시적 변수다. 에너지경제연구원 이슈페이퍼 23-09도 같은 구조를 전제로
+    "BESS 용량이 증가할 경우 SMP가 0원인 시간이 줄어들어 차익거래의 편익이 감소"한다고 본다.
+
+    이 함수는 ①만 계산한다. ②~④는 계통 서비스 대가로 출력제어 흡수와 별개이며, 포함하면
+    '제어 회피로 생긴 가치'가 부풀려진다. 즉 이 값은 보수적인 하한이다.
+
+    charge_price_krw_per_kwh 기본값 0은 제어 시간의 하루전 SMP가 0 이하라는 실측에 근거한다.
+    음수 SMP 구간에서는 충전이 오히려 수익이므로 0은 보수적인 가정이다.
+    """
+    if result.delivered_mwh is None:
+        raise ValueError("delivered_mwh가 없습니다 — simulate_with_storage 결과만 지원합니다 "
+                         "(정격출력만 보는 방식은 방전을 모델링하지 않습니다)")
+    price = (discharge_price_krw_per_kwh
+             if discharge_price_krw_per_kwh is not None
+             else SMP_2023_AVG_KRW_PER_KWH * EVENING_SMP_RATIO)
+    revenue = result.delivered_mwh * 1000 * price
+    cost = result.total_absorbed_mwh * 1000 * charge_price_krw_per_kwh
+    return {
+        "absorbed_mwh": round(result.total_absorbed_mwh, 1),
+        "delivered_mwh": round(result.delivered_mwh, 1),
+        "discharge_price_krw_per_kwh": round(price, 1),
+        "charge_price_krw_per_kwh": charge_price_krw_per_kwh,
+        "revenue_krw": round(revenue),
+        "charge_cost_krw": round(cost),
+        "net_value_krw": round(revenue - cost),
+        "net_value_eok": round((revenue - cost) / 1e8, 1),
+        "excluded": "용량요금·예비력 정산금 제외 (계통 서비스 대가이므로 제어 회피 가치와 분리)",
+    }
 
 
 DEFAULT_DISCHARGE_HOURS = (18, 19, 20, 21, 22)
@@ -147,7 +204,7 @@ def simulate_with_storage(
 
     soc = lo
     hourly: list[HourlyEssResult] = []
-    total_curt = total_abs = discharged = 0.0
+    total_curt = total_abs = discharged = delivered = 0.0
     hours_full = 0
     for c, h in zip(hourly_curtailment_mwh, hod):
         c = max(0.0, c)
@@ -162,6 +219,9 @@ def simulate_with_storage(
             out = min(rated_power_mw, soc - lo)
             soc -= out
             discharged += out
+            # 저장고에서 나온 out 중 계통에 도달하는 것은 out x 방전효율이다.
+            # 왕복효율을 충·방전에 대칭 배분하므로 delivered/absorbed = round_trip_efficiency가 된다.
+            delivered += out * k
         hourly.append(HourlyEssResult(hour_index=len(hourly), curtailment_mwh=c, absorbed_mwh=absorbed))
         total_curt += c
         total_abs += absorbed
@@ -172,6 +232,7 @@ def simulate_with_storage(
         absorption_rate=rate, hourly=hourly,
         energy_capacity_mwh=energy_capacity_mwh, usable_capacity_mwh=usable,
         hours_full=hours_full, annual_cycles=(discharged / usable) if usable > 0 else 0.0,
+        delivered_mwh=delivered,
     )
 
 

@@ -15,6 +15,8 @@ client = TestClient(app)
 
 weather24 = [{"hour": h, "solar_rad": 1.5 if 7 <= h <= 18 else 0.0, "temp": 20.0, "cloud": 3.0,
               "wind_speed": 6.0} for h in range(1, 25)]
+# 풍력만 있고 태양광 기상값이 없는 요청 — 계통 전체 침투율 모델로 전환되지 않아야 한다
+wind_only24 = [{"hour": h, "wind_speed": 6.0} for h in range(1, 25)]
 
 
 def post(body):
@@ -40,12 +42,13 @@ check("태양광 제어량 null", all(h["expected_curtailment_mwh"] is None for 
 check("태양광 note 존재", bool(b["note"]))
 check("model_used=보정 태양광", b["model_used"] == "classifier_solar_calibrated_sigmoid")
 
-print("== /predict wind (수요 포함) ==")
+print("== /predict wind (수요 + 태양광 기상값 -> 계통 전체 침투율 모델) ==")
 r = post({"energy_type": "wind", "region": "한림읍", "target_date": "2023-06-15", "weather": weather24,
           "demand_forecast_mw": [600.0] * 24})
 check("200", r.status_code == 200, r.text)
 b = r.json()
-check("model_used=보정 수요모델", b["model_used"] == "classifier_wind_demand_calibrated_sigmoid")
+check("model_used=계통 전체 침투율 모델",
+      b["model_used"] == "classifier_wind_demand_crossp_calibrated_sigmoid", b["model_used"])
 check("풍력 제어량 값 존재", all(h["expected_curtailment_mwh"] is not None for h in b["hourly"]))
 # 확률 통일 검증: expected = curtailment_probability x E[제어량|제어] 이므로
 # expected / probability 가 물리적으로 말이 되는 조건부 제어량(0~500MWh)이어야 한다.
@@ -53,6 +56,13 @@ implied = [h["expected_curtailment_mwh"] / h["curtailment_probability"]
            for h in b["hourly"] if h["curtailment_probability"] > 0.01]
 check("expected = prob x 조건부 관계 성립", bool(implied) and all(0 <= v <= 500 for v in implied),
       f"implied 조건부 제어량 범위: {min(implied):.1f}~{max(implied):.1f}" if implied else "확률이 모두 0")
+
+print("== /predict wind (태양광 기상값 생략 -> 풍력 단독 모델로 되돌아감) ==")
+r = post({"energy_type": "wind", "region": "한림읍", "target_date": "2023-06-15", "weather": wind_only24,
+          "demand_forecast_mw": [600.0] * 24})
+check("200", r.status_code == 200, r.text)
+check("model_used=수요 포함·교차 미포함",
+      r.json()["model_used"] == "classifier_wind_demand_calibrated_sigmoid", r.json()["model_used"])
 
 print("== /predict wind (수요 생략 -> 자동 전환, 수정 전에는 500 에러) ==")
 r = post({"energy_type": "wind", "region": "한림읍", "target_date": "2023-06-15", "weather": weather24})
