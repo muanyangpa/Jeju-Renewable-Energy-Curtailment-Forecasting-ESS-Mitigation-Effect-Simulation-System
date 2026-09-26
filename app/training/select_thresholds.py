@@ -32,6 +32,7 @@ import numpy as np
 import pandas as pd
 
 from app.model_io import MODELS_DIR, load_artifact
+from app.serving_config import artifact_name, features_for, path_key
 from app.training.train_classifier import (SERVED_METHOD, build_dataset, calibrate, make_model)
 
 BASE_END = "2022-01-01"
@@ -48,12 +49,10 @@ GRID = np.round(np.arange(0.01, 0.96, 0.01), 2)
 MIN_POS_FOR_THRESHOLD = 50
 
 # /predict의 모델 자동 전환 경로 전부 — (발전원, 수요, 교차피처, 서빙 아티팩트명)
-PATHS = (
-    ("wind", True, "converter", "classifier_wind_demand_crossp_calibrated_sigmoid"),
-    ("wind", True, None, "classifier_wind_demand_calibrated_sigmoid"),
-    ("wind", False, None, "classifier_wind_calibrated_sigmoid"),
-    ("solar", True, None, "classifier_solar_demand_calibrated_sigmoid"),
-    ("solar", False, None, "classifier_solar_calibrated_sigmoid"),
+PATHS = tuple(
+    (et, ud, "converter" if uc else None, artifact_name(et, ud, uc))
+    for et, ud, uc in (("wind", True, True), ("wind", True, False), ("wind", False, False),
+                       ("solar", True, False), ("solar", False, False))
 )
 
 
@@ -75,7 +74,9 @@ def _f1_grid(p: np.ndarray, y: np.ndarray) -> list[dict]:
 
 
 def select_one(energy_type: str, use_demand: bool, cross: str | None, artifact: str) -> dict:
-    df, features = build_dataset(energy_type, use_demand, cross)
+    df, features_all = build_dataset(energy_type, use_demand, cross)
+    # 배포 모델과 같은 피처 구성을 써야 확률 척도가 비교 가능하다
+    features = features_for(path_key(energy_type, use_demand, cross == "converter"), features_all)
     base_tr = df[df.dt < BASE_END]
     calib = df[(df.dt >= CALIB_START) & (df.dt < CALIB_END)]
     sel = df[(df.dt >= SEL_START) & (df.dt < SEL_END)]

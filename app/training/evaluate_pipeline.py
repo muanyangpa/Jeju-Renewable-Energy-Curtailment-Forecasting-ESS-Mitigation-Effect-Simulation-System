@@ -25,7 +25,8 @@ import pandas as pd
 from app.data_prep import (OTHER_SOURCE, add_cross_source_penetration,
                            add_normalized_features, add_time_features, build_labeled_hourly,
                            load_asos, load_asos_multi, load_demand_actual, load_generation_actual)
-from app.metrics import classification_report, saturation_warning
+from app.metrics import classification_report, day_block_ci, saturation_warning
+from app.serving_config import artifact_name
 from app.model_io import MODELS_DIR, converter_predict_mwh, load_artifact
 
 TEST_START, TEST_END = "2023-01-01", "2024-01-01"
@@ -41,9 +42,10 @@ def evaluate(energy_type: str, use_demand: bool, cross: str | None = None) -> li
     use_cross = cross is not None
     converter = load_artifact(f"converter_{energy_type}")
     # /predict가 서빙하는 것은 보정 모델이므로 서비스 경로 평가도 보정 모델로 한다.
-    clf_name = (f"classifier_{energy_type}" + ("_demand" if use_demand else "")
-                + {None: "", "actual": "_cross", "converter": "_crossp"}[cross]
-                + "_calibrated_sigmoid")
+    if cross == "actual":   # 기록용 변형은 serving_config에 없다
+        clf_name = f"classifier_{energy_type}_demand_cross_calibrated_sigmoid"
+    else:
+        clf_name = artifact_name(energy_type, use_demand, cross == "converter")
     classifier = load_artifact(clf_name)
 
     labeled = build_labeled_hourly(energy_type)
@@ -80,8 +82,11 @@ def evaluate(energy_type: str, use_demand: bool, cross: str | None = None) -> li
         rep = classification_report(df["is_curtailed"].to_numpy(), proba)
         # Sum(p)를 함께 남긴다. expected_curtailment_mwh 총합이 이 값에 비례하므로,
         # 순위 지표가 좋아도 Sum(p)가 실제 제어 시간 수에서 멀어지면 총합 추정이 무너진다.
+        # 서비스 경로 지표에도 일 블록 신뢰구간을 붙인다 — 이 표가 발표에 인용되는 수치다.
+        ci = day_block_ci(df["is_curtailed"].to_numpy(), proba, df["dt"].dt.date.to_numpy())
         rows.append({"model": clf_name, "input": input_name,
-                     "sum_proba": round(float(proba.sum()), 1), **rep})
+                     "sum_proba": round(float(proba.sum()), 1), **rep,
+                     **{f"ci_{k}": f"[{v['lo']}, {v['hi']}]" for k, v in ci.items()}})
         warn = saturation_warning(rep)
         if warn:
             print(f"  ⚠ [{clf_name} / {input_name}] {warn}")

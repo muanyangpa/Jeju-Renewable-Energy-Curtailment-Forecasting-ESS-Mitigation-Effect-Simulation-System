@@ -23,6 +23,7 @@ import pandas as pd
 from app.data_prep import OTHER_SOURCE, add_time_features
 from app.model_io import MODELS_DIR, converter_predict_mwh, load_artifact
 from app.schemas import EnergyType, HourlyPrediction, PredictRequest, PredictResponse
+from app.serving_config import artifact_name
 
 ESS_WARNING = (
     "expected_curtailment_mwh = curtailment_probability x E[제어량|제어 발생]로 계산한 '기댓값'입니다. "
@@ -31,10 +32,11 @@ ESS_WARNING = (
 )
 
 # 타 발전원 발전량을 '컨버터 예측'으로 학습한 변형(_crossp)을 서빙한다. 실측으로 학습한
-# 변형(_cross)은 순위는 비슷하지만(서비스경로 PR-AUC 0.855 vs 0.853) 서빙 입력에서 확률의
-# 크기가 눌린다 — 2023 컨버터 입력 Sum(p)가 398(실제 563시간) vs _crossp 518.
-# expected_curtailment_mwh 총합이 Sum(p)에 비례하므로 이 차이가 그대로 총합 오차가 된다.
-CROSS_ARTIFACT = "classifier_wind_demand_crossp_calibrated_sigmoid"
+# 변형(_cross)은 순위는 비슷하지만 서빙 입력에서 확률의 크기가 눌린다 — 2023 컨버터 입력
+# Sum(p)가 398(실제 563시간) vs _crossp 518. expected_curtailment_mwh 총합이 Sum(p)에
+# 비례하므로 이 차이가 그대로 총합 오차가 된다.
+# 모델군(rf/lr)과 경로별 피처 제외는 serving_config가 정한다.
+CROSS_ARTIFACT = artifact_name("wind", use_demand=True, use_cross=True)
 
 CROSS_NOTE = (
     "태양광 기상값(solar_rad·temp·cloud)이 함께 와서 계통 전체 침투율 포함 모델을 사용했습니다 — "
@@ -190,8 +192,7 @@ def predict(req: PredictRequest) -> PredictResponse:
         and _optional(CROSS_ARTIFACT) is not None
     )
 
-    suffix = ("_demand" if use_demand else "") + ("_crossp" if use_cross else "")
-    clf_name = f"classifier_{energy_type}{suffix}_calibrated_sigmoid"
+    clf_name = artifact_name(energy_type, use_demand, use_cross)
     classifier = _load(clf_name)
 
     proxy = (classifier.get("meta") or {}).get("capacity_proxy_mwh")

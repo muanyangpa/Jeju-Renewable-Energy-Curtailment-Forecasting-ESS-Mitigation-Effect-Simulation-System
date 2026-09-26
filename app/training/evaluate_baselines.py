@@ -31,20 +31,20 @@ import pandas as pd
 
 from app.metrics import classification_report
 from app.model_io import MODELS_DIR, load_artifact
+from app.serving_config import artifact_name
 from app.training.train_classifier import TEST_END, TEST_START, TRAIN_END, build_dataset
 
 # (발전원, 수요 사용, 교차 피처) -> 서빙 아티팩트 이름과 '공정한' 기준선 목록
-SERVED = (
-    ("solar", False, None,        "classifier_solar_calibrated_sigmoid",
-     ("persistence", "climatology", "이용률 단독")),
-    ("solar", True,  None,        "classifier_solar_demand_calibrated_sigmoid",
-     ("persistence", "climatology", "이용률 단독", "침투율 단독")),
-    ("wind",  False, None,        "classifier_wind_calibrated_sigmoid",
-     ("persistence", "climatology", "이용률 단독")),
-    ("wind",  True,  None,        "classifier_wind_demand_calibrated_sigmoid",
-     ("persistence", "climatology", "이용률 단독", "침투율 단독")),
-    ("wind",  True,  "converter", "classifier_wind_demand_crossp_calibrated_sigmoid",
-     ("persistence", "climatology", "이용률 단독", "침투율 단독", "합산 침투율 단독")),
+_BASE = ("persistence", "climatology", "이용률 단독")
+SERVED = tuple(
+    (et, ud, "converter" if uc else None, artifact_name(et, ud, uc), bl)
+    for et, ud, uc, bl in (
+        ("solar", False, False, _BASE),
+        ("solar", True, False, _BASE + ("침투율 단독",)),
+        ("wind", False, False, _BASE),
+        ("wind", True, False, _BASE + ("침투율 단독",)),
+        ("wind", True, True, _BASE + ("침투율 단독", "합산 침투율 단독")),
+    )
 )
 
 RANK_KEYS = ("auc", "pr_auc", "top5_capture")

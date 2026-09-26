@@ -44,6 +44,7 @@ from app.model_io import MODELS_DIR, converter_predict_mwh, load_artifact, save_
 from app.training.train_classifier import SERVED_METHOD, build_dataset as _clf_dataset, calibrate, make_model
 from app.services.ess_simulation import simulate_hourly_capped
 from app.quantile_ensemble import QUANTILES, QuantileEnsemble, ResidualEnsemble
+from app.serving_config import artifact_name
 
 FEATURES = ["generation_mwh", "hour_sin", "hour_cos", "month_sin", "month_cos", "demand_mw"]
 
@@ -128,7 +129,7 @@ def _with_gen(df: pd.DataFrame, gen_col: str) -> pd.DataFrame:
 # [2026-09-26] 계통 전체 침투율 포함 모델로 교체. /predict가 태양광 기상값이 오면 이 모델을
 # 서빙하므로 expected = probability x 조건부의 probability도 같은 모델이어야 한다.
 # 2023 테스트 PR-AUC 0.717 -> 0.805.
-STAGE1_NAME = "classifier_wind_demand_crossp_calibrated_sigmoid"
+STAGE1_NAME = artifact_name("wind", use_demand=True, use_cross=True)
 
 
 def load_stage1() -> dict:
