@@ -82,4 +82,19 @@ r = client.post("/ess/simulate", json={"hourly_curtailment_mwh": [10, 30, 5, 0, 
 b = r.json()
 check("hourly_capped 계산", r.status_code == 200 and b["total_absorbed_mwh"] == 60.0 and b["total_curtailment_mwh"] == 85.0, r.text)
 
+# 저장용량 제약 방식(기본) — 40MWh 저장용량에 SoC 10~90%면 가용 32MWh, 효율 0.9라 충전 손실이 걸려
+# 총 85MWh를 다 받지 못한다. 정격출력만 보는 hourly_capped(60MWh)보다 반드시 작아야 한다.
+r = client.post("/ess/simulate", json={"hourly_curtailment_mwh": [10, 30, 5, 0, 40], "rated_power_mw": 22.5,
+                                       "energy_capacity_mwh": 40})
+b = r.json()
+check("storage_constrained 기본 method", r.status_code == 200 and b["method"] == "storage_constrained", r.text)
+check("저장용량 제약이 상한보다 작음", b["total_absorbed_mwh"] < 60.0 and b["hours_full"] >= 1, r.text)
+check("가용용량 = 저장용량 x SoC 폭", b["usable_capacity_mwh"] == 32.0, r.text)
+
+r = client.post("/ess/simulate", json={"hourly_curtailment_mwh": [10], "soc_min": 0.9, "soc_max": 0.1})
+check("SoC 역전 -> INVALID_SOC_RANGE", r.status_code == 422 and r.json()["error_code"] == "INVALID_SOC_RANGE", r.text)
+
+r = client.post("/ess/simulate", json={"hourly_curtailment_mwh": [10, 20], "hour_of_day": [13]})
+check("hour_of_day 길이 불일치 -> LENGTH_MISMATCH", r.status_code == 422 and r.json()["error_code"] == "LENGTH_MISMATCH", r.text)
+
 print("\n모든 점검 통과")

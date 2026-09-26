@@ -119,8 +119,28 @@ class PredictResponse(BaseModel):
 
 class EssSimulateRequest(BaseModel):
     hourly_curtailment_mwh: list[float] = Field(..., description="시간별 출력제어량(MWh), 24개 또는 임의 길이")
-    rated_power_mw: float = Field(22.5, description="ESS 정격출력(MW) — 04장 03번 슬라이더 값")
-    method: Literal["hourly_capped", "naive_upper_bound"] = "hourly_capped"
+    rated_power_mw: float = Field(65.0, description="ESS 정격출력(MW) — 04장 03번 슬라이더 1축. 기본값은 제주 장주기 BESS 중앙계약시장 물량")
+    method: Literal["storage_constrained", "hourly_capped", "naive_upper_bound"] = "storage_constrained"
+    # --- method="storage_constrained" 전용 (저장용량 제약 반영) ---
+    energy_capacity_mwh: float | None = Field(
+        None, description="ESS 저장용량(MWh) — 슬라이더 2축. 미지정 시 rated_power_mw × 4시간(제주 BESS 기준)"
+    )
+    round_trip_efficiency: float = Field(0.90, gt=0.0, le=1.0, description="왕복효율 — 상용 BESS AC 85~94% 중앙값")
+    soc_min: float = Field(0.10, ge=0.0, lt=1.0, description="최소 충전상태 [가정]")
+    soc_max: float = Field(0.90, gt=0.0, le=1.0, description="최대 충전상태 [가정]")
+    hour_of_day: list[int] | None = Field(
+        None, description="각 시간의 시각(1~24). 미지정 시 1시부터 시작하는 연속 시계열로 간주"
+    )
+
+    @model_validator(mode="after")
+    def _check_storage(self):
+        if self.soc_min >= self.soc_max:
+            raise ValueError("INVALID_SOC_RANGE:soc_min이 soc_max보다 작아야 합니다")
+        if self.energy_capacity_mwh is not None and self.energy_capacity_mwh <= 0:
+            raise ValueError("INVALID_ENERGY_CAPACITY:저장용량은 0보다 커야 합니다")
+        if self.hour_of_day is not None and len(self.hour_of_day) != len(self.hourly_curtailment_mwh):
+            raise ValueError("LENGTH_MISMATCH:hour_of_day 길이가 hourly_curtailment_mwh와 같아야 합니다")
+        return self
 
 
 class EssSimulateResponse(BaseModel):
@@ -129,6 +149,11 @@ class EssSimulateResponse(BaseModel):
     total_curtailment_mwh: float
     total_absorbed_mwh: float
     absorption_rate: float
+    # storage_constrained에서만 채워진다 (정격출력만 쓰는 방식은 저장용량 개념이 없음)
+    energy_capacity_mwh: float | None = None
+    usable_capacity_mwh: float | None = None
+    hours_full: int | None = Field(None, description="ESS가 가득 차서 더 흡수하지 못한 시간 수")
+    annual_cycles: float | None = Field(None, description="가용용량 기준 환산 사이클 수")
 
 
 class ErrorResponse(BaseModel):

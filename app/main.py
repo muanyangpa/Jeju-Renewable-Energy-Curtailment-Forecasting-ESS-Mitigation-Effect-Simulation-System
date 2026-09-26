@@ -23,7 +23,10 @@ app = FastAPI(
 
 
 # schemas.py가 발행하는 도메인 에러코드 목록 (ValueError("<CODE>:<message>") 규약)
-DOMAIN_ERROR_CODES = ("INVALID_HOUR_SET", "MISSING_REQUIRED_FIELD")
+DOMAIN_ERROR_CODES = (
+    "INVALID_HOUR_SET", "MISSING_REQUIRED_FIELD",
+    "INVALID_SOC_RANGE", "INVALID_ENERGY_CAPACITY", "LENGTH_MISMATCH",
+)
 
 
 def _error_code_from_message(msg: str) -> tuple[str, str]:
@@ -59,16 +62,33 @@ def predict(req: PredictRequest):
 @app.post("/ess/simulate", response_model=EssSimulateResponse)
 def ess_simulate(req: EssSimulateRequest):
     """04장 02번(기본 시뮬레이션)·03번(용량 조정 슬라이더)이 공유하는 단일 엔드포인트 —
-    rated_power_mw만 바꿔서 여러 번 호출하면 슬라이더 UI가 된다."""
+    정격출력(MW)·저장용량(MWh) 2축을 바꿔 여러 번 호출하면 슬라이더 UI가 된다.
+
+    method 선택 기준:
+      storage_constrained (기본) — 저장용량·왕복효율·SoC를 반영한 현실 추정. 대표값
+        65MW/260MWh(제주 장주기 BESS 중앙계약시장 물량)에서 2023년 실측 풍력 제어량의 52.5%.
+      hourly_capped — 정격출력만 보는 이론적 상한. 같은 설비에서 72.7%. 계획서 07장 기준값.
+      naive_upper_bound — 제어 발생 시간 × 정격출력. 참고용.
+    """
     if req.method == "naive_upper_bound":
         curtailed_hours = sum(1 for v in req.hourly_curtailment_mwh if v > 0)
         total = sum(req.hourly_curtailment_mwh)
         result = ess_simulation.simulate_naive_upper_bound(curtailed_hours, req.rated_power_mw, total)
-    else:
+    elif req.method == "hourly_capped":
         result = ess_simulation.simulate_hourly_capped(req.hourly_curtailment_mwh, req.rated_power_mw)
+    else:
+        # 저장용량 미지정 시 4시간 — 제주 BESS 65MW/260MWh의 duration
+        capacity = req.energy_capacity_mwh or req.rated_power_mw * 4.0
+        result = ess_simulation.simulate_with_storage(
+            req.hourly_curtailment_mwh, req.rated_power_mw, capacity,
+            hour_of_day=req.hour_of_day, round_trip_efficiency=req.round_trip_efficiency,
+            soc_min=req.soc_min, soc_max=req.soc_max,
+        )
     d = result.to_dict()
     return EssSimulateResponse(
         rated_power_mw=d["rated_power_mw"], method=d["method"],
         total_curtailment_mwh=d["total_curtailment_mwh"], total_absorbed_mwh=d["total_absorbed_mwh"],
         absorption_rate=d["absorption_rate"],
+        energy_capacity_mwh=d.get("energy_capacity_mwh"), usable_capacity_mwh=d.get("usable_capacity_mwh"),
+        hours_full=d.get("hours_full"), annual_cycles=d.get("annual_cycles"),
     )
