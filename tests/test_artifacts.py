@@ -105,3 +105,17 @@ def test_경로별_임계값_파일이_모든_서빙_경로를_덮는다():
     for name, v in thr.items():
         assert 0.0 < v["threshold"] < 1.0, f"{name}: 임계값 {v['threshold']}이 (0,1) 밖"
         assert "reliable" in v, f"{name}: reliable 플래그가 없다"
+
+
+def test_경로별_하이퍼파라미터가_아티팩트에_반영됐다():
+    """serving_config를 고치고 재학습하지 않으면 문서와 실제 모델이 어긋난다."""
+    from app.serving_config import hyperparams
+    for path in PATHS:
+        key = path_key(*path)
+        fam = SERVED_FAMILY[key]
+        want = hyperparams(key, fam)
+        got = (load_artifact(artifact_name(*path)).get("meta") or {}).get("hyperparams")
+        if want:
+            assert got == want, f"{key}: 아티팩트 {got} != 설정 {want} — 재학습하세요"
+        else:
+            assert got == "기본값", f"{key}: 오버라이드가 없는데 {got}가 저장돼 있다"

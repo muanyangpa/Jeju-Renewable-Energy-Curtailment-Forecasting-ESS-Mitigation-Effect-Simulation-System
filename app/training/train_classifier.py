@@ -43,7 +43,8 @@ from app.data_prep import (CURTAILMENT_COVERAGE, OTHER_SOURCE, add_cross_source_
                            load_generation_actual)
 from app.metrics import (classification_report, day_block_ci, paired_day_block_ci,
                          saturation_warning)
-from app.serving_config import SERVED_FAMILY, artifact_name, features_for, path_key
+from app.serving_config import (SERVED_FAMILY, artifact_name, features_for, hyperparams,
+                                path_key)
 from app.training.train_converter import GEN_SOURCE
 from app.model_io import (MODELS_DIR, converter_predict_mwh, feature_ranges, load_artifact,
                           save_artifact)
@@ -129,6 +130,20 @@ def make_lr():
 FAMILIES = {"rf": make_model, "lr": make_lr}
 
 
+def build_family(fam: str, key: str):
+    """모델군 기본값에 경로별 하이퍼파라미터 오버라이드를 적용한다.
+
+    lr은 Pipeline이라 스텝 이름을 접두사로 붙여야 set_params가 먹는다.
+    """
+    model = FAMILIES[fam]()
+    params = hyperparams(key, fam)
+    if not params:
+        return model
+    if fam == "lr":
+        params = {f"logisticregression__{k}": v for k, v in params.items()}
+    return model.set_params(**params)
+
+
 def calibrate(base: RandomForestClassifier, calib: pd.DataFrame, features: list[str],
               method: str = "isotonic") -> CalibratedClassifierCV:
     """기저 모델은 그대로 두고(FrozenEstimator) 보정 구간으로 매핑만 학습.
@@ -169,8 +184,8 @@ def train_one(energy_type: str, use_demand: bool, cross_source: str | None = Non
     served_fam = SERVED_FAMILY.get(key, "rf")
 
     rows, served_proba = [], {}
-    for fam, factory in FAMILIES.items():
-        base = factory()
+    for fam in FAMILIES:
+        base = build_family(fam, key)
         base.fit(train[features], train["is_curtailed"])
         fam_tag = "" if fam == "rf" else f"_{fam}"
         variants = [(None, base, f"{stem}{fam_tag}")]
@@ -191,6 +206,7 @@ def train_one(energy_type: str, use_demand: bool, cross_source: str | None = Non
             save_artifact(
                 art, model, features,
                 model_family=fam,
+                hyperparams=hyperparams(key, fam) or "기본값",
                 calibrated=is_cal,
                 calibration_method=f"{method} (FrozenEstimator, 보정구간 전용)" if is_cal else None,
                 calibration_period=[CALIB_START, CALIB_END] if is_cal else None,
@@ -224,7 +240,9 @@ def train_one(energy_type: str, use_demand: bool, cross_source: str | None = Non
                             if ci else {})})
 
     un = next(r for r in rows if r["family"] == "rf" and r["method"] == "none")
-    print(f"[{stem}] 피처 {len(features)}개 학습 n={un['n_train']}(양성 {un['n_pos_train']}) "
+    hp = {f: hyperparams(key, f) for f in FAMILIES if hyperparams(key, f)}
+    print(f"[{stem}] 피처 {len(features)}개"
+          f"{' 하이퍼파라미터 ' + str(hp) if hp else ''} 학습 n={un['n_train']}(양성 {un['n_pos_train']}) "
           f"보정 n={un['n_calib']}(양성 {un['n_pos_calib']}) "
           f"테스트 n={un['n']}(양성 {un['n_pos']}시간 / {un['n_pos_days_test']}일)")
     for r in rows:

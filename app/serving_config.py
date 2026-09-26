@@ -67,6 +67,40 @@ FEATURE_DROP: dict[str, tuple[str, ...]] = {
 }
 
 
+# 경로별·모델군별 하이퍼파라미터 오버라이드: HYPERPARAMS[경로][모델군]. 없으면 기본값.
+# 모델군별로 나눠야 한다 — RandomForest의 max_depth를 로지스틱 회귀에 주면 터진다.
+#
+# [2026-09-27] 지금까지 주 분류기의 하이퍼파라미터는 탐색 기록 없는 고정값이었다.
+# validate_blockcv.py가 2023을 건드리지 않고(2023 이전 rolling-origin 폴드만) 격자를 탐색하고,
+# 후보를 2023 홀드아웃으로 '확인'한다(선택이 아니라 확인이다).
+#
+#   경로                  2023 이전 최적              사전 이득    2023 확인
+#   wind                  max_depth 6/n_est 400      +0.0039     -> 이득이 무의미해 현행 유지
+#   wind_demand           max_depth 4                +0.0214     -> 세 지표 모두 유의하게 개선, 채택
+#   wind_demand_crossp    C=0.01                     +0.0360     -> 2023에서 차이 없음, 현행 유지
+#   solar / solar_demand  탐색 불가                   —           -> 아래 주석 참고
+#
+# 세 경로가 모두 '더 강한 정규화'를 선호한 것은 표본이 작다는 진단과 일치한다. 다만 2023 이전
+# 폴드가 2개뿐이라 근거가 약하고, 실제로 2023 확인에서 셋 중 둘이 기각됐다 — 사전 이득만 보고
+# 갈아타면 안 된다는 사례다.
+#
+# ⚠ 태양광은 하이퍼파라미터를 탐색할 수 없다. 라벨이 2021-10에 시작하고 블록별 양성이 3~20건뿐
+# 이어서 2023 이전에 성립하는 rolling-origin 폴드가 0개다. 현행값은 **탐색되지 않은 기본값**이며,
+# 테스트 구간을 건드리지 않고 고를 방법이 현재 데이터로는 없다. 라벨을 2024-04까지 늘리면
+# (README '무슨 일이 있었나') 폴드를 하나 더 만들 수 있다.
+# ⚠ 모델군 비교(SERVED_FAMILY)는 각 군의 '기본값' 하이퍼파라미터로 수행했다. 여기에 오버라이드를
+# 넣으면 그 경로의 비교가 한쪽만 튜닝된 상태가 되므로, 재학습 시 model_family_comparison.csv를
+# 다시 읽고 판정이 바뀌지 않았는지 확인할 것. wind_demand는 rf를 튜닝해 rf가 더 유리해졌고
+# (이미 rf 서빙이라 결정은 그대로), lr은 탐색하지 않았다.
+HYPERPARAMS: dict[str, dict[str, dict]] = {
+    "wind_demand": {"rf": {"max_depth": 4}},
+}
+
+
+def hyperparams(key: str, family: str) -> dict:
+    return HYPERPARAMS.get(key, {}).get(family, {})
+
+
 def path_key(energy_type: str, use_demand: bool, use_cross: bool) -> str:
     return energy_type + ("_demand" if use_demand else "") + ("_crossp" if use_cross else "")
 
