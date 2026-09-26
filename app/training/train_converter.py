@@ -19,7 +19,7 @@ from sklearn.metrics import mean_absolute_error
 
 from app.data_prep import (add_time_features, capacity_proxy, latest_capacity_proxy, load_asos,
                            load_asos_multi, load_generation_actual)
-from app.model_io import MODELS_DIR, save_artifact
+from app.model_io import MODELS_DIR, feature_ranges, save_artifact
 
 SOLAR_FEATURES = ["solar_rad", "temp", "cloud", "hour_sin", "hour_cos", "month_sin", "month_cos"]
 WIND_FEATURES = ["wind_speed", "hour_sin", "hour_cos", "month_sin", "month_cos"]
@@ -104,6 +104,11 @@ def train_one(energy_type: str) -> dict:
         train_period=[str(train["dt"].min()), str(train["dt"].max())],
         test_period=[t0, t1],
         test_corr=round(float(corr), 4), test_nmae_pct=round(float(nmae), 2),
+        # 서빙에서 '기상 입력'의 드리프트를 감지하기 위한 학습 분포 범위.
+        # 분류기 쪽 범위(파생 피처)만 보면 컨버터 자신의 외삽 실패를 놓친다 — 컨버터가 학습
+        # 범위 밖으로 나가지 못해 발전량을 눌러 출력하면 그 눌린 값은 분류기 범위 안에 들어와
+        # 조용해진다(풍속 14m/s가 9m/s보다 조용했던 이유). 원본 기상값을 직접 봐야 한다.
+        train_feature_ranges=feature_ranges(train, features),
     )
 
     metrics = {"energy_type": energy_type, "station": station, "test_period": f"{t0}~{t1}",

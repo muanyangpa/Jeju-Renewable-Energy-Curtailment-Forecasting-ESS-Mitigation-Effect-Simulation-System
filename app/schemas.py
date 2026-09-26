@@ -112,6 +112,20 @@ class PredictResponse(BaseModel):
                          "없으면 'classifier_{solar|wind}_calibrated_sigmoid'. "
                          "값을 하드코딩해 분기하지 말 것 — 보정 방식이 바뀌면 이름도 바뀐다"
     )
+    operational_threshold: Optional[float] = Field(
+        None,
+        description=(
+            "이 model_used에 대해 선정된 '제어 발생 경보' 임계값. curtailment_probability가 이 값 "
+            "이상이면 경보로 취급한다. **하드코딩하지 말고 이 값을 쓸 것** — 확률 척도는 모델의 "
+            "피처 구성과 보정 매핑이 함께 만들므로 경로마다 다르다(0.02~0.43). "
+            "operational_threshold_reliable이 false면 표본이 부족해 신뢰할 수 없으니 임계값 판정 "
+            "대신 등급(상위 5%)으로 표시할 것. 선정 절차는 app/training/select_thresholds.py."
+        ),
+    )
+    operational_threshold_reliable: Optional[bool] = Field(
+        None,
+        description="임계값 선정 구간의 양성 표본이 충분했는지(50건 이상). false면 임계값 판정 금지",
+    )
     note: Optional[str] = Field(
         None, description="태양광 응답에는 expected_curtailment_mwh가 null인 이유를 항상 포함"
     )

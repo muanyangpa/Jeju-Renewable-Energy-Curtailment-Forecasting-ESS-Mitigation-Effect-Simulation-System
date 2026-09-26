@@ -60,3 +60,24 @@ def test_stage2의_stage1이_서빙_모델과_같다():
     from app.services.predict import CROSS_ARTIFACT
     from app.training.train_curtailment_regressor import STAGE1_NAME
     assert STAGE1_NAME == CROSS_ARTIFACT
+
+
+def test_경로별_임계값_파일이_모든_서빙_경로를_덮는다():
+    """select_thresholds.py를 돌리지 않고 재학습만 하면 임계값이 옛 확률 척도에 남는다.
+
+    파일이 아예 없으면 skip한다(아직 안 돌린 상태). 있으면 다섯 경로가 모두 있어야 한다.
+    """
+    import json
+    import os
+    path = os.path.join(os.path.dirname(os.path.dirname(__file__)),
+                        "models", "operational_thresholds.json")
+    if not os.path.exists(path):
+        pytest.skip("operational_thresholds.json이 없습니다 — "
+                    "`python -m app.training.select_thresholds`를 실행하세요")
+    with open(path, encoding="utf-8") as f:
+        thr = json.load(f)
+    missing = [n for n in SERVED if n not in thr]
+    assert not missing, f"임계값이 없는 서빙 경로: {missing}"
+    for name, v in thr.items():
+        assert 0.0 < v["threshold"] < 1.0, f"{name}: 임계값 {v['threshold']}이 (0,1) 밖"
+        assert "reliable" in v, f"{name}: reliable 플래그가 없다"

@@ -72,3 +72,13 @@ def test_ess_검증(kw, code):
     with pytest.raises(ValidationError) as e:
         EssSimulateRequest(hourly_curtailment_mwh=[10.0, 20.0], **kw)
     assert _code(e.value) == code
+
+
+def test_응답에_임계값_필드가_있다():
+    """백엔드가 0.03을 하드코딩하지 않으려면 응답에 값이 있어야 한다."""
+    from app.schemas import PredictResponse
+    f = PredictResponse.model_fields
+    assert "operational_threshold" in f and "operational_threshold_reliable" in f
+    # 옛 아티팩트로도 응답이 만들어져야 하므로 둘 다 Optional이어야 한다
+    assert not f["operational_threshold"].is_required()
+    assert not f["operational_threshold_reliable"].is_required()

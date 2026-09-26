@@ -32,7 +32,8 @@ from app.model_io import MODELS_DIR
 from app.schemas import PredictRequest
 from app.services.predict import predict
 
-OP_THRESHOLD = 0.03  # README '운영 임계값' — classifier_wind_demand 기준으로 고른 값
+# 경로별 운영 임계값 — select_thresholds.py가 고른 값을 /predict가 응답에 담아준다.
+# 공통 0.03을 쓰던 시절에는 경로별 발동률이 3.6%~31.8%로 9배 벌어졌다.
 SOLAR_FIELDS = ("solar_rad", "temp", "cloud")
 
 WINDOWS = (
@@ -102,6 +103,8 @@ def run_window(sources, energy_type, with_demand, with_solar_weather, start, end
     d, d1 = date.fromisoformat(start), date.fromisoformat(end)
     n = skipped = warned = 0
     feats, models, probs = Counter(), Counter(), []
+    clf_warned = [0]
+    thr, thr_reliable = None, None
     while d < d1:
         req = day_request(asos, demand, energy_type, d, with_demand, with_solar_weather)
         if req is None:
@@ -111,10 +114,19 @@ def run_window(sources, energy_type, with_demand, with_solar_weather, start, end
             n += 1
             models[res.model_used] += 1
             probs += [h.curtailment_probability for h in res.hourly]
+            thr = res.operational_threshold
+            thr_reliable = res.operational_threshold_reliable
             note = res.note or ""
             if "입력이 학습 분포" in note:
                 warned += 1
-                feats[note.split("—")[1].split()[0]] += 1
+                body = note.split("—")[1].split(".")[0]
+                for part in body.split("/"):
+                    tok = part.strip().split()
+                    if len(tok) >= 2:
+                        feats[f"{tok[0]}:{tok[1]}"] += 1
+                # 분류기 단계만 따로 센다 — 회귀 가드가 쓰는 값이다(아래 main 주석 참고)
+                if "파생->분류기" in body:
+                    clf_warned[0] += 1
         d += timedelta(days=1)
     if not n:
         return None
@@ -123,10 +135,13 @@ def run_window(sources, energy_type, with_demand, with_solar_weather, start, end
             "model_used": max(models, key=models.get), "window": f"{start}~{end}",
             "n_days": n, "n_skipped": skipped,
             "drift_warn_days": warned, "drift_warn_pct": round(warned / n * 100, 2),
-            "drift_features": ";".join(f"{k}:{v}" for k, v in feats.items()),
+            "classifier_drift_pct": round(clf_warned[0] / n * 100, 2),
+            "drift_features": ";".join(f"{k}={v}" for k, v in feats.items()),
             "mean_proba": round(float(p.mean()), 4),
             "p95_proba": round(float(p.quantile(0.95)), 4),
-            "pct_over_op_threshold": round(float((p >= OP_THRESHOLD).mean()) * 100, 1)}
+            "op_threshold": thr, "op_threshold_reliable": thr_reliable,
+            "pct_over_op_threshold": (round(float((p >= thr).mean()) * 100, 1)
+                                      if thr is not None else None)}
 
 
 def main() -> pd.DataFrame:
@@ -148,8 +163,10 @@ def main() -> pd.DataFrame:
                 continue
             rows.append({"path": label, "span": name, **r})
             print(f"  {name:12} n={r['n_days']:4}일 skip={r['n_skipped']:3}  "
-                  f"드리프트경고 {r['drift_warn_pct']:5.1f}%  "
-                  f"확률평균 {r['mean_proba']:.4f}  임계 0.03 초과 {r['pct_over_op_threshold']:5.1f}%"
+                  f"드리프트 전체 {r['drift_warn_pct']:5.1f}% (분류기 {r['classifier_drift_pct']:4.1f}%)  "
+                  f"확률평균 {r['mean_proba']:.4f}  "
+                  f"임계 {r['op_threshold']} 초과 {r['pct_over_op_threshold']:5.1f}%"
+                  f"{'' if r['op_threshold_reliable'] else '(임계값 신뢰불가)'}"
                   f"  {r['drift_features']}")
         print()
 
@@ -166,26 +183,38 @@ def main() -> pd.DataFrame:
     #
     # 보정 구간(2022 하반기)은 기저 학습 범위 밖 데이터이므로 여기서 울리는 것은 정상이다 —
     # 가드에 넣지 않는다.
+    # 가드는 '분류기 단계'만 본다. 컨버터는 학습 구간이 다르므로(태양광 컨버터는 2024-03~12
+    # 10개월뿐 — 신규 발전량 데이터셋이 2024년부터 시작하고 2025년을 테스트로 빼기 때문)
+    # 분류기 학습 구간의 기상값이 컨버터 범위를 벗어나는 것은 정상이고 실제 신호다.
     GUARD_PCT = 2.0
-    bad = out[(out.span == "학습 구간") & (out.drift_warn_pct > GUARD_PCT)]
+    bad = out[(out.span == "학습 구간") & (out.classifier_drift_pct > GUARD_PCT)]
     if len(bad):
         print(f"\n⚠ 기저 학습 구간에서 드리프트 경고가 {GUARD_PCT}%를 넘었다 — 감지기가 과민하다. "
               "train_classifier.feature_ranges를 확인할 것 "
               "(p1~p99를 쓰면 정의상 2%가 범위 밖이 되어 이 값이 20%대로 뛴다):")
         print(bad[["path", "span", "drift_warn_pct", "drift_features"]].to_string(index=False))
     else:
-        print(f"\n✅ 기저 학습 구간 드리프트 경고 {out[out.span=='학습 구간'].drift_warn_pct.max():.1f}% "
-              f"(<= {GUARD_PCT}%) — 감지기가 학습 데이터에서 울리지 않는다")
+        print(f"\n✅ 기저 학습 구간에서 '분류기 단계' 드리프트 경고 "
+              f"{out[out.span=='학습 구간'].classifier_drift_pct.max():.1f}% (<= {GUARD_PCT}%) — "
+              f"감지기가 학습 데이터에서 울리지 않는다")
+        conv = out[out.span == "학습 구간"].drift_warn_pct.max()
+        if conv > GUARD_PCT:
+            print(f"   (같은 구간의 '컨버터 단계' 경고는 {conv:.1f}%다 — 컨버터 학습 구간이 다르기 "
+                  f"때문이고 오탐이 아니다. 태양광 컨버터는 2024-03~12 10개월만 학습했다.)")
 
     # 운영 임계값 점검: 0.03은 classifier_wind_demand 기준으로 고른 값이다.
     t23 = out[out.span == "테스트 2023"]
-    print("\n[운영 임계값 0.03의 모델별 발동률 — 2023]")
+    print("\n[경로별 운영 임계값의 실측 발동률 — 2023]")
     for _, r in t23.iterrows():
         rate = base_rate["wind" if r.energy_type == "wind" else "solar"]
+        if r.pct_over_op_threshold is None:
+            print(f"  {r.path:26} 임계값 미선정 — select_thresholds.py를 실행하세요")
+            continue
         ratio = r.pct_over_op_threshold / rate
-        flag = "  ⚠ 실제 제어율의 " + f"{ratio:.1f}배" if ratio > 2.0 else ""
-        print(f"  {r.path:26} {r.pct_over_op_threshold:5.1f}% (실제 {rate:.2f}%){flag}")
-    print("  -> 발동률이 모델마다 크게 다르면 0.03을 공통으로 쓸 수 없다. 모델별 재선정이 필요하다.")
+        flag = (f"  ⚠ 실제 제어율의 {ratio:.1f}배" if ratio > 2.0 else
+                f"  ⚠ 임계값 신뢰불가" if not r.op_threshold_reliable else "")
+        print(f"  {r.path:26} 임계 {r.op_threshold}: {r.pct_over_op_threshold:5.1f}% "
+              f"(실제 {rate:.2f}%, {ratio:.2f}배){flag}")
     return out
 
 

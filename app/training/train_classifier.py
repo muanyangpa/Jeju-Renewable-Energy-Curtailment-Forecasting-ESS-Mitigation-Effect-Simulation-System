@@ -40,7 +40,8 @@ from app.data_prep import (CURTAILMENT_COVERAGE, OTHER_SOURCE, add_cross_source_
                            load_generation_actual)
 from app.metrics import classification_report, saturation_warning
 from app.training.train_converter import GEN_SOURCE
-from app.model_io import MODELS_DIR, converter_predict_mwh, load_artifact, save_artifact
+from app.model_io import (MODELS_DIR, converter_predict_mwh, feature_ranges, load_artifact,
+                          save_artifact)
 
 # [2026-09-25] 발전량 절대값(MWh) -> 정규화 피처로 교체.
 # 제주 태양광 설비 증설로 MWh 분포가 해마다 위로 밀려, 학습 범위를 벗어난 입력에서
@@ -94,26 +95,6 @@ def build_dataset(energy_type: str, use_demand: bool,
         features.append("total_penetration")
     df = df.dropna(subset=features).reset_index(drop=True)
     return df, features
-
-
-def feature_ranges(train: pd.DataFrame, features: list[str]) -> dict[str, list[float]]:
-    """학습 구간 각 피처의 [min, max]. 서빙 입력이 이 밖으로 나가면 외삽이라는 신호다.
-
-    [2026-09-26 정정] 처음에는 p1~p99를 썼다. '단일 이상치가 범위를 넓혀 드리프트를 놓친다'는
-    이유였는데, 실측 입력으로 검증해 보니 그 선택이 감지기를 망가뜨렸다 — p1~p99는 **정의상
-    학습 데이터의 2%가 범위 밖**이고, 피처 4개를 OR로 합치면 시간 기준 5.70%가 된다. 하루
-    24시간 중 10%(2.4시간)를 넘는 날이 **학습 구간에서 21.2%**, 2023 테스트 구간에서 34.2%였다.
-    모델이 AUC 0.986을 낸 구간에서 3분의 1이 '외삽'이라고 경고하는 감지기는 잡음이다.
-
-    min~max로 바꾸면 학습 구간이 정의상 0.00%이고 2023년은 시간 기준 0.37%, 하루 기준 1.9%다.
-    드리프트 감지기는 **학습 데이터에서 절대 울리지 않아야** 한다 — 그것이 기준선이다.
-    이상치가 범위를 넓히는 문제는 남지만, 가상의 미탐을 걱정해 실재하는 오탐을 만든 것이
-    더 나쁜 거래였다.
-
-    시각 피처(sin/cos)는 순환값이라 범위를 벗어날 수 없어 _drift_note가 검사에서 건너뛴다.
-    """
-    return {f: [round(float(train[f].min()), 6), round(float(train[f].max()), 6)]
-            for f in features}
 
 
 def make_model() -> RandomForestClassifier:

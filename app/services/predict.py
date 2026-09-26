@@ -12,6 +12,8 @@ app/training/*.py 로 학습된 .joblib 아티팩트를 그대로 사용한다.
 """
 from __future__ import annotations
 
+import json
+import os
 from datetime import datetime, timedelta
 from functools import lru_cache
 
@@ -19,7 +21,7 @@ import numpy as np
 import pandas as pd
 
 from app.data_prep import OTHER_SOURCE, add_time_features
-from app.model_io import converter_predict_mwh, load_artifact
+from app.model_io import MODELS_DIR, converter_predict_mwh, load_artifact
 from app.schemas import EnergyType, HourlyPrediction, PredictRequest, PredictResponse
 
 ESS_WARNING = (
@@ -45,6 +47,10 @@ CROSS_HINT = (
     "정확도가 더 올라갑니다(PR-AUC 0.717 -> 0.805)."
 )
 
+# 하루 24시간 중 이 비율을 넘게 범위를 벗어나면 경고한다. 10% = 2.4시간. [가정]
+# 실측 발동률은 README '드리프트 경고' 표와 models/serving_real_input_verification.csv 참고.
+DRIFT_THRESHOLD = 0.10
+
 SOLAR_NOTE = (
     "태양광 출력제어량(MWh)은 공개되지 않아(연 단위 값만 의원실 자료요청으로 확인됨) "
     "expected_curtailment_mwh를 제공하지 않습니다. curtailment_probability(발생 확률)만 사용하세요."
@@ -56,6 +62,21 @@ def _load(name: str) -> dict:
     return load_artifact(name)
 
 
+@lru_cache(maxsize=1)
+def _thresholds() -> dict:
+    """경로별 운영 임계값. select_thresholds.py가 만든다 (없으면 빈 dict).
+
+    아티팩트 메타데이터가 아니라 별도 파일인 이유: 임계값은 모델이 존재한 **뒤에** 다른
+    스크립트가 다른 구간에서 고른다. 모델을 재학습하지 않고 임계값만 다시 고르는 일이
+    가능해야 하고, 반대로 재학습 후 임계값을 다시 고르지 않으면 값이 비어 그 사실이 드러난다.
+    """
+    path = os.path.join(MODELS_DIR, "operational_thresholds.json")
+    if not os.path.exists(path):
+        return {}
+    with open(path, encoding="utf-8") as f:
+        return json.load(f)
+
+
 def _optional(name: str) -> dict | None:
     try:
         return _load(name)
@@ -63,8 +84,31 @@ def _optional(name: str) -> dict | None:
         return None
 
 
-def _drift_note(classifier: dict, df: pd.DataFrame) -> str | None:
+def _worst_out_of_range(artifact: dict, df: pd.DataFrame) -> tuple[float, str] | None:
+    """아티팩트의 학습 범위를 가장 크게 벗어난 피처와 그 시간 비율. 없으면 None."""
+    ranges = (artifact.get("meta") or {}).get("train_feature_ranges")
+    if not ranges:
+        return None
+    worst: tuple[float, str] | None = None
+    for f, (lo, hi) in ranges.items():
+        if f not in df.columns or f.startswith(("hour_", "month_")):
+            continue  # 시각 피처는 순환값이라 범위를 벗어날 수 없다
+        v = pd.to_numeric(df[f], errors="coerce").to_numpy(dtype=float)
+        frac = float(((v < lo) | (v > hi)).mean())
+        if frac > 0 and (worst is None or frac > worst[0]):
+            worst = (frac, f"{f} {frac:.0%}(학습범위 {lo:g}~{hi:g})")
+    return worst
+
+
+def _drift_note(df: pd.DataFrame, stages: list[tuple[str, dict]]) -> str | None:
     """입력이 학습 분포를 벗어났으면 경고 문구를 만든다 (없으면 None).
+
+    파이프라인의 모든 단계를 본다 — 교차 경로에서는 컨버터가 둘(자기 발전원 + 타 발전원)이다.
+      기상 -> 컨버터        : 원본 기상값(풍속·일사량·기온·전운량)이 컨버터 학습 범위 밖인가
+      기상 -> 타발전원컨버터 : 태양광 기상값이 태양광 컨버터 학습 범위 밖인가
+      파생 -> 분류기        : capacity_factor·penetration 등이 분류기 학습 범위 밖인가
+    분류기 쪽만 보면 컨버터 자신의 외삽 실패를 놓친다 — 컨버터가 발전량을 눌러 출력하면
+    그 눌린 값은 분류기 범위 안에 들어와 조용해진다.
 
     [왜 필요한가] RandomForest는 외삽을 못 한다. 입력이 학습 범위를 벗어나면 경계값에
     포화돼 큰 값들이 서로 구분되지 않고 순위가 무너지는데, 응답만 보면 알 수 없다.
@@ -80,27 +124,22 @@ def _drift_note(classifier: dict, df: pd.DataFrame) -> str | None:
     임계 10%(하루 24시간 중 2.4시간)는 운영 판단이다 [가정]. 실측 입력으로 확인한 발동률은
     학습 구간 0.0%, 2023 테스트 1.9%, 2025~2026년은 아래 README '드리프트 경고' 표 참고.
 
-    [한계] 보는 것은 '분류기의 입력'이지 원본 기상값이 아니다. 컨버터 자신이 학습 범위 밖으로
-    외삽하지 못해 발전량을 눌러 출력하면, 그 눌린 값은 분류기 학습 범위 안에 들어와 이 경고가
-    뜨지 않는다(풍속 14m/s가 9m/s보다 조용한 이유다). 컨버터 입력의 드리프트는 별도 점검이
-    필요하다 — 아직 없다.
+    두 단계를 따로 보고하는 이유: 기상값이 범위 밖이면 발전량 예측부터 못 믿을 값이고,
+    파생 피처만 범위 밖이면 발전량은 그럴듯한데 분류 확률이 포화된 경우다. 처방이 다르다
+    (앞은 컨버터 재학습, 뒤는 분류기 재학습 또는 설비용량 대리지표 갱신).
     """
-    ranges = (classifier.get("meta") or {}).get("train_feature_ranges")
-    if not ranges:
+    parts = []
+    for stage, art in stages:
+        if art is None:
+            continue
+        w = _worst_out_of_range(art, df)
+        if w and w[0] >= DRIFT_THRESHOLD:
+            parts.append(f"{stage} {w[1]}")
+    if not parts:
         return None
-    worst: tuple[float, str] | None = None
-    for f, (lo, hi) in ranges.items():
-        if f not in df.columns or f.startswith(("hour_", "month_")):
-            continue  # 시각 피처는 순환값이라 범위를 벗어날 수 없다
-        v = df[f].to_numpy(dtype=float)
-        frac = float(((v < lo) | (v > hi)).mean())
-        if frac > 0 and (worst is None or frac > worst[0]):
-            worst = (frac, f"{f} {frac:.0%}(학습범위 {lo:g}~{hi:g})")
-    if worst is None or worst[0] < 0.10:
-        return None
-    return (f"⚠ 입력이 학습 분포를 벗어났습니다 — {worst[1]}. RandomForest는 외삽하지 못해 "
-            f"확률이 경계에 포화되고 순위가 무너질 수 있습니다. 재학습을 권고합니다"
-            f"(README '입력 정규화'·'알려진 한계').")
+    return (f"⚠ 입력이 학습 분포를 벗어났습니다 — {' / '.join(parts)}. RandomForest는 외삽하지 "
+            f"못해 예측이 경계에 포화되고 순위가 무너질 수 있습니다. 재학습을 권고합니다"
+            f"(README '드리프트 경고').")
 
 
 def predict(req: PredictRequest) -> PredictResponse:
@@ -174,7 +213,13 @@ def predict(req: PredictRequest) -> PredictResponse:
             (df["generation_mwh"] + df["other_generation_mwh"]) / df["demand_mw"])
 
     proba = classifier["model"].predict_proba(df[classifier["features"]])[:, 1]
-    drift = _drift_note(classifier, df)
+    # 교차 경로에서는 타 발전원 컨버터도 같은 기상값을 받으므로 그 범위도 함께 본다.
+    stages = [("기상->컨버터", converter)]
+    if use_cross:
+        stages.append((f"기상->{OTHER_SOURCE[energy_type]}컨버터",
+                       _load(f"converter_{OTHER_SOURCE[energy_type]}")))
+    stages.append(("파생->분류기", classifier))
+    drift = _drift_note(df, stages)
 
     # 풍력 + 수요예측이면 같은 확률에 조건부 제어량을 곱해 기댓값을 만든다.
     # 두 값이 같은 확률을 쓰므로 expected / probability = 조건부 제어량이 성립한다.
@@ -215,7 +260,17 @@ def predict(req: PredictRequest) -> PredictResponse:
     if drift:
         note = f"{drift} {note}" if note else drift
 
+    thr = _thresholds().get(clf_name) or {}
+    if thr and not thr.get("reliable", True):
+        # 신뢰할 수 없는 임계값을 조용히 내려보내면 백엔드가 그대로 경보에 쓴다.
+        hint = (f"운영 임계값 {thr['threshold']}은 선정 구간 양성이 "
+                f"{thr.get('n_pos_sel')}건뿐이라 신뢰할 수 없습니다 — 임계값 판정 대신 "
+                f"등급(상위 5%)으로 표시하세요.")
+        note = f"{note} {hint}" if note else hint
+
     return PredictResponse(
         energy_type=energy_type, region=req.region, target_date=req.target_date,
         hourly=hourly, model_used=clf_name, note=note,
+        operational_threshold=thr.get("threshold"),
+        operational_threshold_reliable=thr.get("reliable"),
     )
