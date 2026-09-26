@@ -10,3 +10,4 @@ fastapi>=0.110
 uvicorn[standard]>=0.29
 pydantic>=2.6,<3
 httpx>=0.27  # smoke_test.py(TestClient) 실행용
+pytest>=8.0  # tests/ 실행용. CI(.github/workflows/ci.yml)도 이 버전을 쓴다

@@ -63,6 +63,42 @@ def _optional(name: str) -> dict | None:
         return None
 
 
+def _drift_note(classifier: dict, df: pd.DataFrame) -> str | None:
+    """입력이 학습 분포를 벗어났으면 경고 문구를 만든다 (없으면 None).
+
+    [왜 필요한가] RandomForest는 외삽을 못 한다. 입력이 학습 범위를 벗어나면 경계값에
+    포화돼 큰 값들이 서로 구분되지 않고 순위가 무너지는데, 응답만 보면 알 수 없다.
+    이 저장소는 실제로 그 함정에 빠진 적이 있다 — 설비 증설로 태양광 발전량이 학습 범위를
+    3.8% 초과하면서 PR-AUC가 0.406까지 떨어졌고, 정규화로 고쳤지만 설비용량 대리지표가
+    학습 시점 값으로 고정돼 증설이 이어지면 다시 벌어진다. README가 '연 1회 이상 재학습'을
+    권고하는 근거이기도 하다. 그 시점을 사람이 달력으로 재는 대신 입력이 말해주게 한다.
+
+    임계 10%는 재학습이 필요하다고 볼 만한 수준으로 정한 운영 판단이다 [가정] —
+    2023년의 태양광 드리프트(3.76%)가 PR-AUC를 크게 깎았으므로 보수적으로 잡았다.
+
+    [한계] 보는 것은 '분류기의 입력'이지 원본 기상값이 아니다. 컨버터 자신이 학습 범위 밖으로
+    외삽하지 못해 발전량을 눌러 출력하면, 그 눌린 값은 분류기 학습 범위 안에 들어와 이 경고가
+    뜨지 않는다(풍속 14m/s가 9m/s보다 조용한 이유다). 컨버터 입력의 드리프트는 별도 점검이
+    필요하다 — 아직 없다.
+    """
+    ranges = (classifier.get("meta") or {}).get("train_feature_ranges")
+    if not ranges:
+        return None
+    worst: tuple[float, str] | None = None
+    for f, (lo, hi) in ranges.items():
+        if f not in df.columns or f.startswith(("hour_", "month_")):
+            continue  # 시각 피처는 순환값이라 범위를 벗어날 수 없다
+        v = df[f].to_numpy(dtype=float)
+        frac = float(((v < lo) | (v > hi)).mean())
+        if frac > 0 and (worst is None or frac > worst[0]):
+            worst = (frac, f"{f} {frac:.0%}(학습범위 {lo:g}~{hi:g})")
+    if worst is None or worst[0] < 0.10:
+        return None
+    return (f"⚠ 입력이 학습 분포를 벗어났습니다 — {worst[1]}. RandomForest는 외삽하지 못해 "
+            f"확률이 경계에 포화되고 순위가 무너질 수 있습니다. 재학습을 권고합니다"
+            f"(README '입력 정규화'·'알려진 한계').")
+
+
 def predict(req: PredictRequest) -> PredictResponse:
     energy_type: EnergyType = req.energy_type
     converter = _load(f"converter_{energy_type}")
@@ -134,6 +170,7 @@ def predict(req: PredictRequest) -> PredictResponse:
             (df["generation_mwh"] + df["other_generation_mwh"]) / df["demand_mw"])
 
     proba = classifier["model"].predict_proba(df[classifier["features"]])[:, 1]
+    drift = _drift_note(classifier, df)
 
     # 풍력 + 수요예측이면 같은 확률에 조건부 제어량을 곱해 기댓값을 만든다.
     # 두 값이 같은 확률을 쓰므로 expected / probability = 조건부 제어량이 성립한다.
@@ -169,6 +206,10 @@ def predict(req: PredictRequest) -> PredictResponse:
         note = ("조건부 회귀 아티팩트(curtailment_stage2_wind)가 없어 확률만 반환하고 "
                 "expected_curtailment_mwh는 null입니다. "
                 "`python -m app.training.train_curtailment_regressor`로 학습하세요.")
+
+    # 드리프트 경고는 다른 안내보다 먼저 읽혀야 한다 — 그 아래 수치의 신뢰도를 깎는 정보다.
+    if drift:
+        note = f"{drift} {note}" if note else drift
 
     return PredictResponse(
         energy_type=energy_type, region=req.region, target_date=req.target_date,

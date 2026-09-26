@@ -96,6 +96,17 @@ def build_dataset(energy_type: str, use_demand: bool,
     return df, features
 
 
+def feature_ranges(train: pd.DataFrame, features: list[str]) -> dict[str, list[float]]:
+    """학습 구간 각 피처의 [p1, p99]. 서빙 입력이 이 밖으로 나가면 외삽이라는 신호다.
+
+    최소·최대 대신 p1·p99를 쓰는 이유: 학습 데이터의 단일 이상치가 범위를 넓혀버리면
+    드리프트를 놓친다. 시각 피처(sin/cos)는 순환값이라 항상 [-1,1]이므로 의미가 없지만
+    제외하지 않고 그대로 둔다 — 제외 규칙을 두면 피처가 늘 때 빠뜨린다.
+    """
+    return {f: [round(float(train[f].quantile(0.01)), 6),
+                round(float(train[f].quantile(0.99)), 6)] for f in features}
+
+
 def make_model() -> RandomForestClassifier:
     return RandomForestClassifier(class_weight="balanced", n_estimators=200, max_depth=6,
                                   random_state=42, n_jobs=-1)
@@ -160,6 +171,10 @@ def train_one(energy_type: str, use_demand: bool, cross_source: str | None = Non
             capacity_proxy_mwh=proxy_now,
             input_generation="actual",  # 서비스 경로 성능은 evaluate_pipeline 참고
             cross_source=cross_source,  # 타 발전원 발전량의 출처 (None/actual/converter)
+            # 서빙에서 드리프트를 감지하기 위한 학습 분포 범위. RandomForest는 외삽을 못 하므로
+            # 입력이 이 범위를 벗어나면 경계에 포화되고 순위가 무너진다 — 그런데 응답만 보면
+            # 알 수 없다. /predict가 이 범위와 비교해 note로 알린다.
+            train_feature_ranges=feature_ranges(train, features),
             test_report=report,
             served_by_predict=(method == SERVED_METHOD),
         )
