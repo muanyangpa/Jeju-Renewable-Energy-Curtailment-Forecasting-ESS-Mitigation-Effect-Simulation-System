@@ -126,6 +126,25 @@ def _to_weather(wide: pd.DataFrame, target: date, station: str = "184") -> list[
     return out
 
 
+def _ssl_context():
+    """TLS 검증용 컨텍스트. CA 번들을 명시한다.
+
+    [왜 필요한가] macOS의 python.org 설치판은 시스템 키체인을 쓰지 않고, 'Install
+    Certificates.command'를 실행하지 않으면 **CA 저장소가 비어 있다**(ssl.get_default_verify_paths()의
+    cafile이 None). 그 상태에서는 모든 HTTPS가 CERTIFICATE_VERIFY_FAILED로 막힌다 — 기상청뿐
+    아니라 google.com도 막히므로 서버 문제로 오해하기 쉽다.
+
+    검증을 끄는 것은 답이 아니다(중간자 공격을 못 막는다). certifi가 들어 있으면 그 번들을
+    쓰고, 없으면 시스템 기본값으로 둔다.
+    """
+    import ssl
+    try:
+        import certifi
+        return ssl.create_default_context(cafile=certifi.where())
+    except ImportError:
+        return ssl.create_default_context()
+
+
 def resolve_key(portal: str | None = None, key: str | None = None) -> tuple[str, str]:
     """(포털 이름, 인증키). 환경변수에서 찾고, 없으면 무엇을 해야 하는지 알려주며 실패한다."""
     if portal and portal not in PORTALS:
@@ -157,6 +176,7 @@ def fetch(target: date, lat: float = 33.5141, lon: float = 126.5297,
         with open(sample_path, encoding="utf-8") as f:
             payload = json.load(f)
     else:
+        import urllib.error
         import urllib.parse
         import urllib.request
         name, auth = resolve_key(portal, key)
@@ -169,8 +189,34 @@ def fetch(target: date, lat: float = 33.5141, lon: float = 126.5297,
         q = urllib.parse.urlencode({
             cfg["key_param"]: auth, "dataType": "JSON", "numOfRows": "1000", "pageNo": "1",
             "base_date": base_date, "base_time": base_time, "nx": nx, "ny": ny})
-        with urllib.request.urlopen(f"{cfg['url']}?{q}", timeout=timeout) as resp:
-            raw = resp.read().decode("utf-8")
+        url = f"{cfg['url']}?{q}"
+        try:
+            with urllib.request.urlopen(url, timeout=timeout,
+                                        context=_ssl_context()) as resp:
+                raw = resp.read().decode("utf-8")
+        except urllib.error.HTTPError as e:
+            # 401/403은 키가 틀렸거나 활용신청이 아직 승인되지 않은 상태다 — 원인을 짚어준다.
+            hint = ""
+            if e.code in (401, 403):
+                hint = (f"\n  인증이 거부됐습니다({e.code}). 확인할 것:\n"
+                        f"  1) {cfg['env']}에 넣은 키가 이 포털({cfg['label']})의 키인지\n"
+                        f"  2) 활용신청이 '승인' 상태인지 (신청 직후에는 대기일 수 있습니다)\n")
+                if name == "data.go.kr":
+                    hint += ("  3) 공공데이터포털은 키가 Encoding/Decoding 두 형태로 나옵니다 — "
+                             "**Decoding 키**를 넣어야 합니다\n")
+            raise RuntimeError(f"{cfg['label']} HTTP {e.code} {e.reason}{hint}") from None
+        except urllib.error.URLError as e:
+            if "CERTIFICATE_VERIFY_FAILED" in str(e):
+                raise RuntimeError(
+                    "TLS 인증서 검증에 실패했습니다. 이 파이썬에 CA 번들이 연결돼 있지 않은 "
+                    "상태로 보입니다(기상청만이 아니라 모든 HTTPS가 막힙니다).\n"
+                    "  해결 1) pip install certifi  — 설치돼 있으면 이 코드가 자동으로 씁니다\n"
+                    "  해결 2) macOS python.org 설치판이면 "
+                    "'/Applications/Python 3.x/Install Certificates.command' 실행\n"
+                    "  확인)  python -c \"import ssl; print(ssl.get_default_verify_paths())\"\n"
+                    "         cafile이 None이면 위 상태입니다.\n"
+                    f"  원본: {e}") from None
+            raise
         try:
             payload = json.loads(raw)
         except json.JSONDecodeError:

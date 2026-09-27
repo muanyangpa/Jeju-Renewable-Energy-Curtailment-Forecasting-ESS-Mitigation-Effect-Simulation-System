@@ -11,3 +11,4 @@ uvicorn[standard]>=0.29
 pydantic>=2.6,<3
 httpx>=0.27  # smoke_test.py(TestClient) 실행용
 pytest>=8.0  # tests/ 실행용. CI(.github/workflows/ci.yml)도 이 버전을 쓴다
+certifi>=2024.2  # HTTPS CA 번들. macOS 파이썬은 CA 저장소가 비어 있는 경우가 있다
