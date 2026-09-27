@@ -40,7 +40,7 @@ from app.data_prep import (add_cross_source_penetration, add_normalized_features
                            add_time_features, build_labeled_hourly, load_asos_multi,
                            load_demand_actual, load_generation_actual)
 from app.metrics import classification_report
-from app.model_io import MODELS_DIR, converter_predict_mwh, load_artifact, save_artifact
+from app.model_io import MODELS_DIR, converter_predict_mwh, depends_on, load_artifact, save_artifact
 from app.training.train_classifier import SERVED_METHOD, build_dataset as _clf_dataset, calibrate, make_model
 from app.services.ess_simulation import simulate_hourly_capped
 from app.quantile_ensemble import QUANTILES, QuantileEnsemble, ResidualEnsemble
@@ -421,6 +421,9 @@ def main() -> dict:
                        stage="2_conditional_regressor", trained_on_curtailed_hours_only=True,
                        stage1_artifact=STAGE1_NAME,
                        stage1_calibration_period=stage1_art["meta"].get("calibration_period"),
+                       # stage1 분류기와 두 컨버터에 의존한다 — 그중 하나만 재학습하면
+                       # 확률 척도나 generation_pred가 어긋나 기댓값 총합이 조용히 틀어진다.
+                       depends_on=depends_on(STAGE1_NAME, "converter_wind", "converter_solar"),
                        train_period=[str(train["dt"].min()), str(train["dt"].max())],
                        test_period=[TEST_START, TEST_END], input_generation=deployed,
                        ess_threshold=thr, threshold_criterion="f1_max (탐지 경보용)",

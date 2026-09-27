@@ -46,8 +46,8 @@ from app.metrics import (classification_report, day_block_ci, paired_day_block_c
 from app.serving_config import (SERVED_FAMILY, artifact_name, features_for, hyperparams,
                                 path_key)
 from app.training.train_converter import GEN_SOURCE
-from app.model_io import (MODELS_DIR, converter_predict_mwh, feature_ranges, load_artifact,
-                          save_artifact)
+from app.model_io import (MODELS_DIR, converter_predict_mwh, depends_on, feature_ranges,
+                          load_artifact, save_artifact)
 
 # [2026-09-25] 발전량 절대값(MWh) -> 정규화 피처로 교체.
 # 제주 태양광 설비 증설로 MWh 분포가 해마다 위로 밀려, 학습 범위를 벗어난 입력에서
@@ -207,6 +207,10 @@ def train_one(energy_type: str, use_demand: bool, cross_source: str | None = Non
                 art, model, features,
                 model_family=fam,
                 hyperparams=hyperparams(key, fam) or "기본값",
+                # 교차 경로는 타 발전원 컨버터의 '예측 발전량'으로 학습하므로 그 아티팩트에
+                # 의존한다. 컨버터만 재학습하면 total_penetration 분포가 조용히 어긋난다.
+                depends_on=(depends_on(f"converter_{OTHER_SOURCE[energy_type]}")
+                            if cross_source == "converter" else None),
                 calibrated=is_cal,
                 calibration_method=f"{method} (FrozenEstimator, 보정구간 전용)" if is_cal else None,
                 calibration_period=[CALIB_START, CALIB_END] if is_cal else None,

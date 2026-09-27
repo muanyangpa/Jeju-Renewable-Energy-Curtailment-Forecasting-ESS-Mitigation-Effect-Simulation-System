@@ -47,6 +47,20 @@ def top5_precision(y_true: np.ndarray, y_score: np.ndarray) -> float:
     return float(y_true[top_idx].mean())
 
 
+def _brier_skill(y_true: np.ndarray, y_score: np.ndarray) -> float:
+    """기준 예측(상수 = 해당 구간의 양성률)에 대한 Brier 스킬스코어.
+
+    기준값으로 '테스트 구간 자신의 양성률'을 쓴다 — 예측 문헌의 climatological reference와 같고,
+    학습된 모델이 아니라 참조 예측이므로 리키지가 아니다. 학습 구간 기저율을 쓰면 구간 간
+    기저율 차이(2021~22 4.1% vs 2023 6.4%)가 스킬에 섞여 모델 품질과 구분되지 않는다.
+    """
+    base = float(np.mean(y_true))
+    ref = brier_score_loss(y_true, np.full(len(y_true), base)) if 0 < base < 1 else float("nan")
+    if not ref or math.isnan(ref):
+        return float("nan")
+    return float(1.0 - brier_score_loss(y_true, y_score) / ref)
+
+
 def classification_report(y_true, y_score) -> dict:
     """모든 지표를 한 번에 계산해 dict로 반환 (소수 4자리 반올림)."""
     y_true = np.asarray(y_true).astype(int)
@@ -59,6 +73,11 @@ def classification_report(y_true, y_score) -> dict:
         "auc": float(roc_auc_score(y_true, y_score)) if has_both else float("nan"),
         "pr_auc": float(average_precision_score(y_true, y_score)) if has_both else float("nan"),
         "brier": float(brier_score_loss(y_true, y_score)) if len(y_true) else float("nan"),
+        # Brier는 기저율이 낮으면 그 자체로는 의미를 읽을 수 없다 — 양성률 6%에서 '전부 0에 가깝게'
+        # 예측하는 상수 예측기도 0.06 정도가 나온다. 그래서 기준 예측(기후값 = 구간 양성률)에
+        # 대한 스킬스코어를 함께 낸다. 1 - Brier(모델)/Brier(상수)이고, 0이면 상수와 같고
+        # 1이면 완벽하다. 음수면 상수보다 나쁘다는 뜻이다.
+        "brier_skill": _brier_skill(y_true, y_score) if len(y_true) else float("nan"),
         "top5_capture": top5_capture(y_true, y_score),
         "top5_ceiling": top5_ceiling(y_true),
         "top5_precision": top5_precision(y_true, y_score),

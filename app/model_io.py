@@ -39,6 +39,32 @@ def save_artifact(name: str, model, features: list[str], **meta) -> str:
     return path
 
 
+def depends_on(*names: str) -> dict:
+    """상위 아티팩트의 학습 시각을 기록한다 — 재학습 순서가 어긋난 것을 잡기 위한 것.
+
+    [왜 필요한가]
+    교차 피처(total_penetration)를 도입하면서 분류기가 **컨버터의 출력**에 의존하게 됐다.
+    `classifier_wind_demand_crossp`는 학습 시점의 태양광 컨버터가 예측한 발전량으로
+    total_penetration을 만든다. 컨버터만 재학습하면 그 분포가 조용히 달라지는데, 응답만 보면
+    알 수 없다 — 기존의 capacity_proxy_mwh 일치 규약과 같은 성격의 불변식인데 그쪽만
+    테스트로 고정돼 있었다.
+
+    stage2도 같다. stage1 분류기와 두 컨버터에 의존한다.
+
+    여기 기록한 시각이 의존 아티팩트의 현재 trained_at보다 오래되면 재학습이 필요하다는 뜻이다
+    (tests/test_artifacts.py가 검사한다).
+    """
+    out = {}
+    for name in names:
+        path = os.path.join(MODELS_DIR, f"{name}.joblib")
+        if not os.path.exists(path):
+            out[name] = None
+            continue
+        meta = joblib.load(path).get("meta") or {}
+        out[name] = meta.get("trained_at")
+    return out
+
+
 def feature_ranges(train: pd.DataFrame, features: list[str]) -> dict[str, list[float]]:
     """학습 구간 각 피처의 [min, max]. 서빙 입력이 이 밖으로 나가면 외삽이라는 신호다.
 

@@ -119,3 +119,33 @@ def test_경로별_하이퍼파라미터가_아티팩트에_반영됐다():
             assert got == want, f"{key}: 아티팩트 {got} != 설정 {want} — 재학습하세요"
         else:
             assert got == "기본값", f"{key}: 오버라이드가 없는데 {got}가 저장돼 있다"
+
+
+def _trained_at(name: str) -> str | None:
+    return (load_artifact(name).get("meta") or {}).get("trained_at")
+
+
+@pytest.mark.parametrize("name", [
+    artifact_name("wind", True, True),          # 교차 경로 — 타 발전원 컨버터에 의존
+    "curtailment_stage2_wind",                  # stage1 + 두 컨버터에 의존
+])
+def test_의존_아티팩트가_더_최근에_학습되지_않았다(name):
+    """상위 아티팩트만 재학습하면 total_penetration·generation_pred 분포가 조용히 어긋난다.
+
+    예: 태양광 컨버터를 재학습하면 crossp 분류기가 학습한 total_penetration 척도가 달라지는데
+    응답만 보면 알 수 없다. capacity_proxy_mwh 일치 규약과 같은 성격의 불변식이다.
+    """
+    meta = load_artifact(name).get("meta") or {}
+    deps = meta.get("depends_on")
+    if not deps:
+        pytest.skip(f"{name}: depends_on이 없습니다 — 재학습하면 기록됩니다")
+    mine = meta.get("trained_at")
+    assert mine, f"{name}: trained_at이 없다"
+    for dep, recorded in deps.items():
+        now = _trained_at(dep)
+        assert recorded == now, (
+            f"{name}이 학습된 시점의 {dep}({recorded})가 현재({now})와 다릅니다 — "
+            f"{dep}가 그 뒤에 재학습됐습니다. 의존 순서대로 다시 학습하세요: "
+            f"train_converter -> train_classifier -> train_curtailment_regressor")
+        assert now is None or now <= mine, (
+            f"{dep}({now})가 {name}({mine})보다 나중에 학습됐습니다 — 순서가 뒤바뀌었습니다")
