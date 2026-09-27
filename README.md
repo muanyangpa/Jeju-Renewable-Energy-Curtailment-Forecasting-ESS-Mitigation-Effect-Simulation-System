@@ -41,7 +41,9 @@ python -m app.training.validate_blockcv              # 인과적 rolling-origin 
 python -m app.training.evaluate_new_regime           # 신제도(2024-06~) 성능, 대리 라벨 기준
 python -m app.training.evaluate_baselines            # 나이브 기준선 대비 기여도
 python -m app.training.diagnose_models               # 신뢰도 곡선·순열 중요도
+python -m app.training.train_radiation_model         # 일사량 추정 (예보에 일사량이 없어 필요)
 python -m app.training.diagnose_stage2               # stage2 손실함수 비교 (음성 결과 기록)
+python -m app.training.evaluate_forecast_degradation # 예보 항목 입력의 정보 손실 측정
 python -m app.training.select_thresholds             # 경로별 운영 임계값 선정 (재학습 후 필수)
 python -m app.training.verify_serving_real_inputs    # 실측 입력을 /predict에 넣어 서빙 검증
 
@@ -1313,6 +1315,82 @@ HVDC 운영 방식이 달라서다. 공통점은 **수확 체감**이다 — 에
 ESS 증설이 아니라 **제한된 용량의 우선 배분**을 목표로 하는 이유다 — 65MW/260MWh가 제어량의
 절반만 흡수한다면, 남은 절반을 어디에 쓸지 고르는 문제가 남는다.
 
+### 기상청 단기예보 연동 — '하루전 예측'이라고 말할 수 있게 됐다 (2026-09-27)
+
+**이전까지 이 저장소는 사후 분석 도구였다.** 모든 평가가 ASOS **실측 관측치** 입력이었고, 예보를
+받아오는 경로가 없었다. 하루전시장 입찰마감이 D-1 11시인데 하루전 입력을 만들 수 없었다.
+
+**단기예보에는 일사량이 없다.** `getVilageFcst`가 주는 14개 항목은 TMP·TMN·TMX·SKY·PTY·POP·
+PCP·SNO·REH·WSD·VEC·UUU·VVV·WAV다. 태양광 컨버터가 필수로 쓰는 `solar_rad`가 없고, `cloud`는
+전운량(0~10)이 아니라 SKY 코드(1/3/4)로만 온다. 그래서 두 가지가 필요했다.
+
+| 항목 | 예보 | 대응 |
+|---|---|---|
+| 기온 | `TMP` | 그대로 |
+| 풍속 | `WSD` | 그대로 — **풍력 경로는 손실 없음** |
+| 전운량 | `SKY`(1/3/4) | 구간 대표값으로 역변환(2.5/7/9.5). 양자화 손실이 남는다 |
+| **일사량** | **없음** | **청천일사량 × 감쇠계수로 추정** (아래) |
+
+**일사량 추정 = 물리 + 학습** (`app/solar_radiation.py`, `app/training/train_radiation_model.py`)
+
+청천일사량(구름이 없을 때 지표 도달 일사)은 위치·날짜·시각으로 결정론적으로 계산된다
+(Haurwitz 모델). 실제 일사량은 거기에 구름이 곱하는 감쇠이고, 그 감쇠를 ASOS 실측으로 학습한다.
+
+    일사량 ≈ 청천일사량(계산) × 청천지수 kt(SKY·기온·습도·시각으로 학습)
+
+**시각 규약이 중요하다.** 이 저장소는 `h시`를 '그 구간의 끝'으로 쓰므로 태양 위치를 **구간 중앙
+(−30분)**에서 계산한다. 이걸 빼먹으면 아침·저녁이 체계적으로 치우친다. 검증: 맑은 날(전운량 ≤ 1)
+실측 대 청천일사량이 13시 2.92 vs 2.89, 12시 2.76 vs 2.74 MJ/m²로 거의 일치한다.
+
+| 일사량 추정 모델 (ASOS 184, 학습 <2025 / 테스트 2025) | 주간 MAE | 주간 NMAE | R² |
+|---|---|---|---|
+| **청천지수 회귀 × 청천일사량 (채택)** | **0.2289** | **18.76%** | **0.934** |
+| 직접 MJ/m² 회귀 | 0.2304 | 18.88% | 0.933 |
+| 기준선 — SKY별 평균 kt만 사용 | 0.2959 | 24.25% | 0.896 |
+
+SKY별 평균 청천지수는 맑음 0.869 · 구름많음 0.622 · 흐림 0.240으로 물리적으로 타당하다.
+
+**예보 항목만 쓸 때의 손실을 처음으로 측정했다** (`app/training/evaluate_forecast_degradation.py`,
+`models/forecast_degradation.csv`). 태양광 컨버터, 2025 테스트:
+
+| 입력 | NMAE | corr | 실측 대비 총합 |
+|---|---|---|---|
+| ① ASOS 실측 (지금까지의 문서 수치) | 23.45% | 0.9522 | 0.895x |
+| ② 일사량만 추정 | 26.44% | 0.9399 | 0.922x |
+| ③ 전운량만 SKY 양자화 | 23.48% | 0.9526 | 0.900x |
+| **④ 예보 항목만 (②+③)** | **26.48%** | 0.9397 | 0.928x |
+
+**손실은 +3.03%p(상대 12.9%)이고 거의 전부 일사량 추정에서 온다** — 전운량 양자화는 +0.03%p로
+사실상 무해하다(컨버터 순열 중요도에서 `cloud`가 부차적인 것과 일치한다). **풍력은 `WSD`가
+예보에 있어 정보 손실이 0이다.**
+
+> **이 측정이 하는 것과 못 하는 것.** 기온·풍속·하늘상태에 **실측**을 넣었으므로 '완벽한 예보'
+> 가정이다 — 예보 자체의 오차는 빠져 있다. 즉 이것도 여전히 상한이지만, **상한이 두 단계로
+> 나뉘었다**: 실측 입력 > 예보 항목 입력 > 실제 예보 입력. 세 번째는 예보 아카이브가 필요하다.
+
+**어댑터** (`app/services/kma_forecast.py`). `/predict`가 이미 기상값 24개를 호출자에게 받으므로,
+연동은 새 엔드포인트가 아니라 **예보를 요청 본문으로 바꾸는 변환**이다.
+
+```python
+from app.services.kma_forecast import build_predict_request
+body = build_predict_request("wind", date(2026, 3, 15), demand_forecast_mw=[...])
+# -> {"energy_type": ..., "weather": [24개], ...} 그대로 POST /predict
+```
+
+- **발표시각은 `0800`이 기본이다.** base_time은 0200·0500·0800·1100·1400·1700·2000·2300이고,
+  거래일 24시간을 D-1 11시 마감 전에 다 받으려면 08시 발표를 쓴다(1100은 마감과 동시라 위험).
+- **격자 좌표는 변환식으로 구한다.** 지점표를 옮겨 적는 대신 위경도 → 격자(nx, ny) 변환을 넣었다 —
+  관측지점이 아니라 **발전단지 좌표**로 예보를 받아야 하기 때문이다(풍력 컨버터 오차의 원인이
+  관측지점–단지 위치 불일치다). 공식 예시로 검증했다: 서울 종로구 (60, 127), 제주시청 (53, 38).
+  기준점 상수에 `+1`을 빼먹으면 전국이 (1,1)씩 밀린다 — 실제로 한 번 그랬다.
+- **풍력 요청에도 태양광 기상값이 함께 들어간다** — 계통 전체 침투율 모델로 자동 전환되도록
+  어댑터가 네 항목을 모두 채운다.
+
+> **⚠ HTTP 호출 경로는 검증하지 못했다.** 공공데이터포털 인증키(`KMA_SERVICE_KEY`)가 필요하다.
+> 변환·추정 로직은 저장된 응답(`sample_path`)으로 끝에서 끝까지 시험했고(`tests/test_forecast.py`
+> 7종), 실제 호출은 키를 넣고 한 번 확인해야 한다. 격자 변환과 청천일사량은 공식 예시·ASOS로
+> 검증했으므로 남은 미검증 부분은 HTTP 요청·응답 파싱뿐이다.
+
 ### 드리프트 경고 — 모델이 낡았는지 응답이 알려준다 (2026-09-26)
 
 RandomForest는 외삽을 못 한다. 입력이 학습 범위를 벗어나면 경계값에 포화돼 큰 값들이 서로
@@ -1604,16 +1682,19 @@ ai_server/
     main.py                 # FastAPI 앱, 엔드포인트, 에러코드 매핑
     metrics.py              # 분류 평가 지표 공통 + 일 블록 부트스트랩 신뢰구간
     serving_config.py       # 서빙 모델군(rf/lr)·경로별 피처 제외·하이퍼파라미터의 단일 출처
+    solar_radiation.py      # 청천일사량 계산 + 기상청 SKY 코드·격자 좌표 변환
     quantile_ensemble.py    # 분포 앙상블(분위수/잔차) — E[X], E[min(X,cap)] 적분
     model_io.py             # 모델 저장/로드, 메타데이터·버전 확인, 컨버터 출력 MWh 환산,
                             #   학습 범위(드리프트용)·의존 아티팩트 시각 기록
     services/
       predict.py            # 컨버터+분류기+회귀 추론 파이프라인
       ess_simulation.py      # ESS 흡수율 계산 (상한 2종 + 저장용량 제약 + 차익거래 가치)
+      kma_forecast.py        # 기상청 단기예보 -> /predict 요청 본문 어댑터
   tests/
       test_ess_simulation.py       # 물리적 불변식 (데이터 불필요)
       test_schemas.py              # 도메인 에러코드·기본값
       test_drift.py                # 드리프트 경고 임계 동작
+      test_forecast.py             # 격자 변환·청천일사량·예보 어댑터
       test_artifacts.py            # 아티팩트 정합성 (없으면 skip)
     training/
       train_converter.py
@@ -1627,6 +1708,8 @@ ai_server/
       diagnose_models.py           # 신뢰도 곡선(확률 품질) + 순열 중요도(죽은 피처 탐지)
       validate_blockcv.py          # rolling-origin CV(인과적) + 하이퍼파라미터 탐색 기록
       diagnose_stage2.py           # 조건부 회귀의 손실함수 대안 비교 (전부 현행보다 나쁨)
+      train_radiation_model.py     # 단기예보 항목 -> 일사량 추정 (예보에 일사량이 없다)
+      evaluate_forecast_degradation.py # 예보 항목만 쓸 때의 정보 손실 측정
       select_thresholds.py         # 경로별 운영 임계값 F1 최대 선정 + 신뢰도 판정
       verify_serving_real_inputs.py # 실측 ASOS·수요를 /predict에 넣어 드리프트·임계값 검증
       solar_potential_curtailment.py  # 태양광 조건부 잠재발전량 모델 실험 (07장 방법C, 서비스에 미사용)
