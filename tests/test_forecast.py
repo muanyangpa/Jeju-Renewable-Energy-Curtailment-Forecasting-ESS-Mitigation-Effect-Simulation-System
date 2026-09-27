@@ -102,3 +102,43 @@ def test_맑음이_흐림보다_일사량이_많다(tmp_path):
     cs = sum(w["solar_rad"] for w in clear)
     cc = sum(w["solar_rad"] for w in cloudy)
     assert cs > cc * 1.5, f"맑음 {cs:.2f} vs 흐림 {cc:.2f} — 하늘상태가 반영되지 않았다"
+
+
+# --- 인증키 처리 (네트워크 없이) ---
+
+def test_키가_없으면_무엇을_해야_하는지_알려주며_실패한다(monkeypatch):
+    from app.services.kma_forecast import PORTALS, resolve_key
+    for cfg in PORTALS.values():
+        monkeypatch.delenv(cfg["env"], raising=False)
+    with pytest.raises(RuntimeError) as e:
+        resolve_key()
+    msg = str(e.value)
+    for cfg in PORTALS.values():           # 두 포털의 환경변수 이름이 안내에 모두 나와야 한다
+        assert cfg["env"] in msg
+    assert "export" in msg, "무엇을 하라는 지시가 없으면 안내가 아니다"
+
+
+def test_포털별_인증_파라미터_이름이_다르다():
+    """API허브는 authKey, 공공데이터포털은 serviceKey — 이걸 섞으면 인증이 통째로 실패한다."""
+    from app.services.kma_forecast import PORTALS
+    assert PORTALS["apihub"]["key_param"] == "authKey"
+    assert PORTALS["data.go.kr"]["key_param"] == "serviceKey"
+    # 환경변수 이름을 파라미터 이름과 맞춰 뒀다 — 어느 포털 키인지 헷갈리지 않도록
+    assert PORTALS["apihub"]["env"] == "KMA_AUTH_KEY"
+    assert PORTALS["data.go.kr"]["env"] == "KMA_SERVICE_KEY"
+
+
+def test_둘_다_있으면_API허브를_쓴다(monkeypatch):
+    """수치모델 API가 허브에만 있어 키를 하나로 통일하는 쪽이 낫다."""
+    from app.services.kma_forecast import resolve_key
+    monkeypatch.setenv("KMA_AUTH_KEY", "a")
+    monkeypatch.setenv("KMA_SERVICE_KEY", "b")
+    assert resolve_key() == ("apihub", "a")
+    assert resolve_key("data.go.kr") == ("data.go.kr", "b")
+
+
+def test_잘못된_포털_이름은_거부한다(monkeypatch):
+    from app.services.kma_forecast import resolve_key
+    monkeypatch.setenv("KMA_AUTH_KEY", "a")
+    with pytest.raises(ValueError, match="portal"):
+        resolve_key("kma")

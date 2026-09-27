@@ -38,7 +38,28 @@ from app.data_prep import add_time_features
 from app.model_io import load_artifact
 from app.solar_radiation import add_solar_geometry, cloud_from_sky, latlon_to_grid
 
-ENDPOINT = ("https://apis.data.go.kr/1360000/VilageFcstInfoService_2.0/getVilageFcst")
+# 같은 서비스(VilageFcstInfoService_2.0 / 동네예보 > 단기예보조회)를 두 포털이 각자 제공한다.
+# 응답 스키마가 동일하므로 바뀌는 것은 호스트와 인증 파라미터 이름뿐이다.
+#
+#   API허브        인증 파라미터 authKey     — 수치모델 API가 여기에만 있어 키를 통일하기 좋다
+#   공공데이터포털   인증 파라미터 serviceKey
+#
+# 환경변수 이름을 각 포털의 파라미터 이름과 똑같이 맞췄다 — 어느 포털의 키인지 헷갈릴 자리를
+# 없애려는 것이다. 둘 다 있으면 API허브를 쓴다.
+PORTALS = {
+    "apihub": {
+        "url": "https://apihub.kma.go.kr/api/typ02/openApi/VilageFcstInfoService_2.0/getVilageFcst",
+        "key_param": "authKey",
+        "env": "KMA_AUTH_KEY",
+        "label": "기상청 API허브 (예보 > 동네예보 > 단기예보조회)",
+    },
+    "data.go.kr": {
+        "url": "https://apis.data.go.kr/1360000/VilageFcstInfoService_2.0/getVilageFcst",
+        "key_param": "serviceKey",
+        "env": "KMA_SERVICE_KEY",
+        "label": "공공데이터포털 (기상청_단기예보 조회서비스)",
+    },
+}
 # 발표시각. 하루전시장 입찰마감(D-1 11시) 전에 거래일 24시간을 다 받으려면 0800이 기본이다.
 BASE_TIMES = ("0200", "0500", "0800", "1100", "1400", "1700", "2000", "2300")
 DEFAULT_BASE_TIME = "0800"
@@ -105,12 +126,31 @@ def _to_weather(wide: pd.DataFrame, target: date, station: str = "184") -> list[
     return out
 
 
+def resolve_key(portal: str | None = None, key: str | None = None) -> tuple[str, str]:
+    """(포털 이름, 인증키). 환경변수에서 찾고, 없으면 무엇을 해야 하는지 알려주며 실패한다."""
+    if portal and portal not in PORTALS:
+        raise ValueError(f"portal은 {list(PORTALS)} 중 하나여야 합니다 (받은 값: {portal!r})")
+    if key:
+        return portal or "apihub", key
+    order = [portal] if portal else list(PORTALS)
+    for name in order:
+        env = PORTALS[name]["env"]
+        v = os.environ.get(env)
+        if v:
+            return name, v.strip()
+    lines = [f"  export {PORTALS[n]['env']}=발급받은키    # {PORTALS[n]['label']}" for n in order]
+    raise RuntimeError("기상청 인증키를 찾지 못했습니다. 아래 중 하나를 환경변수로 넣으세요.\n"
+                       + "\n".join(lines))
+
+
 def fetch(target: date, lat: float = 33.5141, lon: float = 126.5297,
-          base_time: str = DEFAULT_BASE_TIME, service_key: str | None = None,
-          sample_path: str | None = None, timeout: float = 10.0) -> list[dict]:
+          base_time: str = DEFAULT_BASE_TIME, key: str | None = None,
+          portal: str | None = None, sample_path: str | None = None,
+          timeout: float = 10.0) -> list[dict]:
     """거래일 target의 예보를 받아 /predict의 weather 24개로 만든다.
 
-    service_key는 공공데이터포털 인증키다. 환경변수 KMA_SERVICE_KEY로도 받는다.
+    인증키는 환경변수에서 읽는다 — KMA_AUTH_KEY(API허브) 또는 KMA_SERVICE_KEY(공공데이터포털).
+    key 인자로 직접 줄 수도 있지만 **소스나 로그에 키를 남기지 말 것**.
     sample_path에 저장된 JSON 응답을 주면 HTTP 호출 없이 변환만 수행한다(오프라인 시험용).
     """
     if sample_path:
@@ -119,18 +159,25 @@ def fetch(target: date, lat: float = 33.5141, lon: float = 126.5297,
     else:
         import urllib.parse
         import urllib.request
-        key = service_key or os.environ.get("KMA_SERVICE_KEY")
-        if not key:
-            raise RuntimeError(
-                "기상청 인증키가 없습니다 — 공공데이터포털에서 '기상청_단기예보 조회서비스'를 "
-                "신청하고 KMA_SERVICE_KEY 환경변수에 넣으세요")
+        name, auth = resolve_key(portal, key)
+        cfg = PORTALS[name]
         nx, ny = latlon_to_grid(lat, lon)
         base_date = (target - timedelta(days=1)).strftime("%Y%m%d")
+        # [주의] 공공데이터포털 인증키는 '일반 인증키(Encoding)'과 '(Decoding)' 두 형태로 나온다.
+        # urlencode가 한 번 더 인코딩하므로 여기에는 **Decoding 키**를 넣어야 한다. Encoding 키를
+        # 넣으면 %2B가 %252B가 되어 SERVICE_KEY_IS_NOT_REGISTERED_ERROR가 난다 — 가장 흔한 실패다.
         q = urllib.parse.urlencode({
-            "serviceKey": key, "dataType": "JSON", "numOfRows": "1000", "pageNo": "1",
+            cfg["key_param"]: auth, "dataType": "JSON", "numOfRows": "1000", "pageNo": "1",
             "base_date": base_date, "base_time": base_time, "nx": nx, "ny": ny})
-        with urllib.request.urlopen(f"{ENDPOINT}?{q}", timeout=timeout) as resp:
-            payload = json.loads(resp.read().decode("utf-8"))
+        with urllib.request.urlopen(f"{cfg['url']}?{q}", timeout=timeout) as resp:
+            raw = resp.read().decode("utf-8")
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError:
+            # 인증 실패·미승인 상태에서는 JSON이 아니라 XML 오류 문서가 온다.
+            raise RuntimeError(
+                f"{cfg['label']} 응답이 JSON이 아닙니다 — 인증키나 활용신청 상태를 확인하세요.\n"
+                f"응답 앞부분: {raw[:300]}") from None
 
     body = (payload.get("response") or {}).get("body") or {}
     header = (payload.get("response") or {}).get("header") or {}
@@ -138,6 +185,35 @@ def fetch(target: date, lat: float = 33.5141, lon: float = 126.5297,
         raise RuntimeError(f"기상청 API 오류 {header.get('resultCode')}: {header.get('resultMsg')}")
     items = ((body.get("items") or {}).get("item")) or []
     return _to_weather(_rows_to_frame(items, target), target)
+
+
+def self_check(target: date | None = None, **kw) -> None:
+    """인증키가 실제로 동작하는지 한 번에 확인한다 — 키를 넣은 직후 이걸 돌려볼 것.
+
+    실행: python -m app.services.kma_forecast
+    """
+    from datetime import date as _date, timedelta as _td
+    target = target or (_date.today() + _td(days=1))
+    print("=" * 70)
+    for name, cfg in PORTALS.items():
+        has = "있음" if os.environ.get(cfg["env"]) else "없음"
+        print(f"  {cfg['env']:18} {has:4}  {cfg['label']}")
+    name, _ = resolve_key(kw.get("portal"), kw.get("key"))
+    lat, lon = kw.get("lat", 33.5141), kw.get("lon", 126.5297)
+    print(f"\n사용 포털: {PORTALS[name]['label']}")
+    print(f"거래일 {target} · 좌표 ({lat}, {lon}) -> 격자 {latlon_to_grid(lat, lon)} · "
+          f"발표시각 {kw.get('base_time', DEFAULT_BASE_TIME)}")
+    weather = fetch(target, **kw)
+    print(f"\n✅ 예보 {len(weather)}시간 수신")
+    print(f"  {'시':>3} {'기온':>6} {'풍속':>6} {'운량':>6} {'일사량':>8}")
+    for w in weather:
+        if w["hour"] in (1, 6, 9, 12, 13, 15, 18, 21, 24):
+            print(f"  {w['hour']:3} {w['temp']:6.1f} {w['wind_speed']:6.1f} "
+                  f"{w['cloud']:6.1f} {w['solar_rad']:8.3f}")
+    rad = sum(w["solar_rad"] for w in weather)
+    print(f"\n  일사량 일적산 {rad:.2f} MJ/m² · 최대 풍속 "
+          f"{max(w['wind_speed'] for w in weather):.1f} m/s")
+    print("  -> build_predict_request()로 /predict에 바로 넣을 수 있습니다.")
 
 
 def build_predict_request(energy_type: str, target: date, region: str = "제주",
@@ -154,3 +230,15 @@ def build_predict_request(energy_type: str, target: date, region: str = "제주"
     if demand_forecast_mw is not None:
         body["demand_forecast_mw"] = demand_forecast_mw
     return body
+
+
+if __name__ == "__main__":
+    import sys
+    from datetime import date as _date
+
+    tgt = _date.fromisoformat(sys.argv[1]) if len(sys.argv) > 1 else None
+    try:
+        self_check(tgt)
+    except Exception as e:                      # 사용자에게 원인을 그대로 보여준다
+        print(f"\n❌ {type(e).__name__}: {e}")
+        sys.exit(1)
