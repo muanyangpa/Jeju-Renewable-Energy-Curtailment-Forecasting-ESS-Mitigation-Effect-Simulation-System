@@ -148,7 +148,7 @@ def test_잘못된_포털_이름은_거부한다(monkeypatch):
 # KIM 일사량 예보로의 교체 — 예보값이 오면 추정 모델을 쓰지 않아야 한다
 # ---------------------------------------------------------------------------
 
-def _kim_sample(tmp_path, target=date(2026, 3, 15), hours=range(1, 25), direct=200.0):
+def _kim_sample(tmp_path, target=date(2026, 3, 15), hours=range(1, 25), direct=50.0):
     """KIM 응답 원문 형식의 가짜 샘플. tests/test_kim_forecast.py의 형식과 같다."""
     from app.services import kim_forecast as K
     import datetime as _dt
@@ -161,6 +161,8 @@ def _kim_sample(tmp_path, target=date(2026, 3, 15), hours=range(1, 25), direct=2
         t = (t0 + _dt.timedelta(hours=hf)).strftime("%Y%m%d%H")
         out.append(f"#hf={hf}")
         for val, name in ((direct, "SWDDIR2(W m-2)"), (100.0, "SWDDIF2(W m-2)"),
+                          # 누적 시간당 1.08 MJ. 순간값 합성은 (200+100)*0.0036 = 1.08로
+                          # 같게 두지 않고 direct를 달리 줘 어느 쪽을 썼는지 구분한다.
                           (1.08 * (hf - hfs[0]), "ACSWDNB(MJ m-2)"),
                           (-3.0, "U80(m s-1)"), (-4.0, "V80(m s-1)"), (283.15, "T2(K)")):
             out.append(f"{t} {tmfc} 000 000 {val} {name}")
@@ -178,7 +180,8 @@ def test_KIM_예보값이_오면_추정을_쓰지_않는다(tmp_path):
     w = fetch(date(2026, 3, 15), sample_path=_sample(tmp_path),
               kim_sample_path=_kim_sample(k), radiation_source=src)
     assert src == ["kim_l010"], src
-    # 샘플은 전 시간 (200+100)*0.0036 = 1.08 MJ로 고정했다 — 추정값이면 야간이 0이 된다
+    # 샘플의 누적차분은 전 시간 1.08 MJ이고 순간값 합성은 (50+100)*0.0036 = 0.54다.
+    # 1.08이 나와야 채택 경로가 누적차분이고, 야간이 0이 아니어야 추정 폴백이 아니다.
     assert all(x["solar_rad"] == pytest.approx(1.08, abs=1e-3) for x in w)
 
 

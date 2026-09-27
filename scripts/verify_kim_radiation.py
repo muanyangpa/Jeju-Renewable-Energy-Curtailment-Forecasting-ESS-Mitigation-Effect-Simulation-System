@@ -27,31 +27,58 @@ LAT, LON = 33.5141, 126.5297
 
 
 def availability(target: dt.date) -> str | None:
-    """가장 최신부터 거슬러 올라가며 실제로 응답이 오는 분석시각을 찾는다."""
+    """가장 최신부터 거슬러 올라가며 실제로 응답이 오는 분석시각을 찾는다.
+
+    **이 함수가 답할 수 없는 것**: "입찰마감(D-1 11시 KST) 시점에 그 자료가 나와 있었는가".
+    지금 응답이 온다는 것은 '실행 시각까지는 생산됐다'는 뜻일 뿐이다. 마감 시점의 가용성은
+    생산 지연을 알아야 하고, 그래서 아래에서 현재 최신 분석시각 대비 경과 시간을 함께 찍는다.
+    """
     key = os.environ.get("KMA_AUTH_KEY")
     if not key:
         sys.exit("KMA_AUTH_KEY 환경변수가 없습니다.")
     ctx = K._ctx()
     base = dt.datetime.combine(target, dt.time(0), tzinfo=K.KST).astimezone(dt.timezone.utc)
-    print("1) 분석시각 가용성  (거래일 24시간을 hf 22~45로 덮는 조건 = base로부터 6~48h 전)")
-    first_ok = None
+    now = dt.datetime.now(dt.timezone.utc)
+    print(f"1) 분석시각 가용성   (실행 시각 {now:%Y-%m-%d %H:%M} UTC)")
+    print("   전체 24시간을 덮으려면 24시(=D+1 00시 KST)의 hf가 48 이하여야 한다.")
+    ok_list: list[tuple[str, int, float]] = []
     for back in (6, 12, 18, 24, 30, 36, 42, 48, 72, 120, 240):
         t = base - dt.timedelta(hours=back)
         t = t.replace(hour=t.hour // 6 * 6, minute=0)
         tmfc = t.strftime("%Y%m%d%H")
-        hf = K.hf_for(target, 13, tmfc)          # 13시(정오 부근) 기준으로 시험
+        hf13, hf24 = K.hf_for(target, 13, tmfc), K.hf_for(target, 24, tmfc)
+        covers = "전체" if hf24 <= 48 else f"부족(24시 hf={hf24})"
         try:
-            v = K._one(key, ctx, tmfc, hf, LAT, LON, 30.0)
+            v = K._one(key, ctx, tmfc, hf13, LAT, LON, 30.0)
         except Exception as e:                                    # noqa: BLE001
-            print(f"   {tmfc} UTC (hf={hf:3})  ✗ {type(e).__name__}")
+            print(f"   {tmfc} UTC  ✗ {type(e).__name__}")
             continue
-        ok = "SWDDIR2" in v
-        print(f"   {tmfc} UTC (hf={hf:3})  {'✓' if ok else '✗ 값 없음'}"
-              + (f"  직달 {v['SWDDIR2']:.1f} W/m²" if ok else ""))
-        if ok and first_ok is None and hf <= 45:
-            first_ok = tmfc
-    print(f"   -> 입찰마감 전에 쓸 수 있는 가장 최신 분석시각: {first_ok or '없음'}")
-    return first_ok
+        if "ACSWDNB" not in v:
+            print(f"   {tmfc} UTC  ✗ 값 없음 (미생산 또는 보관기간 경과)")
+            continue
+        age = (now - t.replace(tzinfo=dt.timezone.utc)).total_seconds() / 3600
+        print(f"   {tmfc} UTC  ✓  분석 후 {age:5.1f}h 경과 · 커버리지 {covers}")
+        if hf24 <= 48:
+            ok_list.append((tmfc, hf24, age))
+
+    if not ok_list:
+        print("   -> 전체 24시간을 덮는 분석시각이 없습니다.")
+        return None
+    newest = ok_list[0]
+    oldest = ok_list[-1]
+    print(f"\n   보관 깊이: 가장 오래된 응답이 분석 후 {oldest[2]:.0f}h "
+          f"({oldest[2]/24:.1f}일) — 과거 예보 아카이브는 "
+          f"{'있습니다' if oldest[2] > 24 * 30 else '사실상 없습니다'}")
+    print(f"   가장 최신: {newest[0]} UTC (분석 후 {newest[2]:.1f}h)")
+    print("   ⚠ 이 결과는 '지금 받을 수 있다'만 말한다. 입찰마감(D-1 11시 KST) 시점의 가용성은\n"
+          "     생산 지연을 알아야 하므로, 마감 직전 시각에 한 번 더 실행해 확인할 것.")
+    # 기본값(D-2 18 UTC)이 살아 있으면 그것을 쓴다 — 마감 전 가용성이 가장 확실하다.
+    dflt = K.default_tmfc(target)
+    if any(t == dflt for t, _, _ in ok_list):
+        print(f"   -> 사용: {dflt} (모듈 기본값, 마감 전 가용성이 가장 안전)")
+        return dflt
+    print(f"   -> 사용: {newest[0]} (기본값 {dflt}는 응답 없음)")
+    return newest[0]
 
 
 def hourly(target: dt.date, tmfc: str) -> list[K.KimHour]:
@@ -60,18 +87,16 @@ def hourly(target: dt.date, tmfc: str) -> list[K.KimHour]:
     rows = K.fetch_day(target, lat=LAT, lon=LON, tmfc=tmfc, errors=errs)
     if errs:
         print(f"   수신 실패 {len(errs)}건 — 첫 건: {errs[0]}")
-    print("   시각  직달W  산란W   합성MJ  누적차분MJ  차이")
+    print("   시각  직달W  산란W   채택MJ  순간값MJ    차이   ← 채택 = ACSWDNB 시간차분")
     for r in rows:
-        d = r.ghi_mj - r.acc_mj if r.acc_mj == r.acc_mj else float("nan")
         print(f"   {r.hour:3}  {r.direct_w:6.1f} {r.diffuse_w:6.1f}  "
-              f"{r.ghi_mj:6.3f}  {r.acc_mj:9.3f}  {d:+.3f}")
+              f"{r.ghi_mj:6.3f}  {r.inst_mj:7.3f}  {r.inst_gap:+7.3f}")
     g = np.array([r.ghi_mj for r in rows])
-    a = np.array([r.acc_mj for r in rows])
-    m = ~np.isnan(a)
-    print(f"   일적산 합성 {g.sum():.2f} MJ/m²  ·  누적차분 {a[m].sum():.2f} MJ/m²")
-    if m.sum():
-        print(f"   두 경로 차이: 평균 {np.mean(g[m]-a[m]):+.4f}  최대절대 "
-              f"{np.max(np.abs(g[m]-a[m])):.4f} MJ/m²")
+    i_ = np.array([r.inst_mj for r in rows])
+    print(f"   일적산 채택 {g.sum():.2f} MJ/m²  ·  순간값 경로 {i_.sum():.2f} MJ/m²")
+    print(f"   두 경로 차이: 평균 {np.mean(i_-g):+.4f}  최대절대 {np.max(np.abs(i_-g)):.4f} MJ/m²")
+    print("   (순간값은 그 시각의 스냅샷이라 시간평균이 아니다. 차이가 큰 시간은 구름 변동이\n"
+          "    심해 시간평균 자체의 대표성이 낮다는 신호다.)")
     print(f"   허브높이(80m) 풍속 {min(r.wind80 for r in rows):.1f}~"
           f"{max(r.wind80 for r in rows):.1f} m/s")
     return rows

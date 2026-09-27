@@ -4,13 +4,25 @@
 기상청 단기예보에는 일사량이 없어 지금은 청천일사량 x 감쇠계수로 추정한다
 (app/solar_radiation.py). KIM 국지모델 표준화 NetCDF에는 실제 예보값이 있다.
 
-  SWDDIR2  직달 일사     W/m^2   순간값
-  SWDDIF2  산란 일사     W/m^2   순간값
-  ACSWDNB  누적 하향단파  MJ/m^2  모델 시작부터의 누적 -> 차분이 필요
+  ACSWDNB  누적 하향단파  MJ/m^2  모델 시작부터의 누적 -> **차분하면 시간적산값**  <= 채택
+  SWDDIR2  직달 일사     W/m^2   그 시각의 순간값
+  SWDDIF2  산란 일사     W/m^2   그 시각의 순간값
   U80/V80  80m 풍속      m/s     허브높이에 가깝다
 
-**직달 + 산란**을 쓴다. 순간값이라 차분이 필요 없고, 수평면 전일사량이 바로 나온다.
-ACSWDNB 차분은 교차검증용으로만 쓴다(hf=0에서 0, hf=24에서 9.32로 단조 증가하는 것을 확인했다).
+**ACSWDNB의 시간차분**을 쓴다. 처음에는 반대로 골랐다 — 직달+산란은 순간값이라 차분이 필요
+없으니 더 단순하다고 본 것인데, 실제 자료로 확인해보니 틀렸다.
+
+순간값은 시간평균이 아니다. 2026-09-28 제주 예보(tmfc=2026092700)에서 14시 순간값이 구름이
+갈라진 순간을 잡아 직달 196.7 W/m^2로 찍혔고, 이것을 한 시간으로 곱하면 1.65 MJ/m^2가 되지만
+같은 시간의 실제 적산값은 0.74다. 13시는 반대로 두꺼운 구름을 잡아 0.31 vs 실제 0.84였다.
+누적장은 정의상 그 한 시간을 적분한 값이므로 이 문제가 없다.
+
+  추정값과의 상관   순간값 합성 0.219  vs  누적차분 0.651
+  청천지수 kt       순간값 합성 0.189  vs  누적차분 0.224   (전운량 예보 0.97에 부합)
+  자기일관성        누적값은 단조증가, 음수차분 0건, 양끝 검산 일치
+
+순간값은 버리지 않고 진단용으로 남긴다(`KimHour.inst_mj`) — 두 경로가 크게 벌어지는 시간은
+구름 변동이 심해 시간평균 자체의 대표성이 낮다는 신호다.
 
 [시각 변환이 이 모듈의 핵심이다]
   tmfc  모델 분석시각, **UTC**
@@ -59,12 +71,17 @@ DEFAULT_TMFC_OFFSET_HOURS = 21
 @dataclass
 class KimHour:
     hour: int                 # 1~24 (KST, 구간의 끝)
-    ghi_mj: float             # 직달 + 산란, MJ/m^2
+    ghi_mj: float             # 채택값 = ACSWDNB 시간차분, MJ/m^2
+    inst_mj: float            # 진단용 = (직달 + 산란) x 0.0036. 순간값이므로 시간평균이 아니다
     direct_w: float
     diffuse_w: float
     wind80: float             # sqrt(U80^2 + V80^2), m/s
     temp_c: float
-    acc_mj: float             # ACSWDNB 누적값 (차분 교차검증용)
+
+    @property
+    def inst_gap(self) -> float:
+        """순간값 경로와의 차이. 크면 그 시간의 구름 변동이 심하다는 뜻이다."""
+        return self.inst_mj - self.ghi_mj
 
 
 def _ctx():
@@ -169,19 +186,23 @@ def fetch_day(target: dt.date, lat: float = 33.5141, lon: float = 126.5297,
     out: list[KimHour] = []
     for h in hours:
         hf = hf_for(target, h, tmfc)
-        v = raw.get(hf) or {}
-        if not {"SWDDIR2", "SWDDIF2"} <= v.keys():
+        v, pv = raw.get(hf) or {}, raw.get(hf - 1) or {}
+        acc, prev = v.get("ACSWDNB"), pv.get("ACSWDNB")
+        if acc is None or prev is None:
             continue
-        prev = (raw.get(hf - 1) or {}).get("ACSWDNB")
-        acc = v.get("ACSWDNB", float("nan"))
+        ghi = acc - prev
+        if ghi < -1e-9:
+            # 누적장이 줄어들 수는 없다. 모델 재시작으로 초기화된 구간이거나 응답이 섞인 것이다.
+            # 조용히 0으로 깎지 않고 그 시간을 버려서 전체 폴백을 유도한다.
+            if errors is not None:
+                errors.append(f"hf={hf} ACSWDNB 감소({prev:.2f} -> {acc:.2f}) — 누적 초기화 의심")
+            continue
         out.append(KimHour(
-            hour=h,
-            ghi_mj=round((v["SWDDIR2"] + v["SWDDIF2"]) * W_TO_MJ_PER_HOUR, 4),
-            direct_w=v["SWDDIR2"], diffuse_w=v["SWDDIF2"],
+            hour=h, ghi_mj=round(ghi, 4),
+            inst_mj=round((v.get("SWDDIR2", 0.0) + v.get("SWDDIF2", 0.0)) * W_TO_MJ_PER_HOUR, 4),
+            direct_w=v.get("SWDDIR2", float("nan")), diffuse_w=v.get("SWDDIF2", float("nan")),
             wind80=round(float(np.hypot(v.get("U80", np.nan), v.get("V80", np.nan))), 2),
-            temp_c=round(v.get("T2", float("nan")) - 273.15, 1),
-            acc_mj=round(acc - prev, 4) if prev is not None and acc == acc else float("nan"),
-        ))
+            temp_c=round(v.get("T2", float("nan")) - 273.15, 1)))
     return out
 
 

@@ -20,6 +20,7 @@ def _line(tmef: str, value: float, name: str) -> str:
 
 
 def _block(hf: int, direct: float, diffuse: float, acc: float) -> str:
+    # 순간값(direct/diffuse)과 누적값(acc)을 일부러 다르게 주어 어느 쪽을 채택했는지 가려낸다.
     t = (dt.datetime(2026, 9, 26, 18) + dt.timedelta(hours=hf)).strftime("%Y%m%d%H")
     return "\n".join([
         f"#hf={hf}",
@@ -39,7 +40,8 @@ def sample(tmp_path):
     tmfc = K.default_tmfc(TARGET)
     hfs = sorted({K.hf_for(TARGET, h, tmfc) for h in range(1, 25)}
                  | {K.hf_for(TARGET, 1, tmfc) - 1})
-    blocks = [_block(hf, 100.0, 50.0, 0.54 * (hf - hfs[0])) for hf in hfs]
+    # 누적은 시간당 1.0 MJ, 순간값 합성은 0.54 MJ — 값이 갈리도록 만든다
+    blocks = [_block(hf, 100.0, 50.0, 1.0 * (hf - hfs[0])) for hf in hfs]
     p = tmp_path / "kim.txt"
     p.write_text("\n".join(blocks) + "\n", encoding="utf-8")
     return str(p)
@@ -84,15 +86,36 @@ class TestParsing:
 
 
 class TestFetchDay:
-    def test_ghi_is_direct_plus_diffuse_in_mj(self, sample):
+    def test_ghi_is_the_accumulated_difference_not_the_instant_value(self, sample):
+        """순간값이 아니라 누적차분을 써야 한다.
+
+        직달·산란은 그 시각의 순간값이라 시간평균이 아니다. 실제 자료에서 14시 순간값이
+        구름이 갈라진 순간을 잡아 1.65 MJ로 나왔지만 같은 시간의 적산값은 0.74였다.
+        누적장은 정의상 한 시간을 적분한 값이므로 이 문제가 없다.
+        """
         rows = K.fetch_day(TARGET, sample_path=sample)
         assert len(rows) == 24
-        assert rows[0].ghi_mj == pytest.approx((100.0 + 50.0) * 0.0036, abs=1e-6)
+        assert rows[0].ghi_mj == pytest.approx(1.0, abs=1e-6)            # 누적차분
+        assert rows[0].inst_mj == pytest.approx(0.54, abs=1e-6)          # 순간값(진단용)
 
-    def test_accumulated_difference_cross_checks_the_composition(self, sample):
-        # 샘플은 시간당 0.54 MJ씩 누적하도록 만들었고 합성값도 0.54다 — 두 경로가 맞아야 한다.
+    def test_instant_path_kept_as_a_diagnostic(self, sample):
+        """두 경로가 벌어지는 시간은 구름 변동이 심하다는 신호이므로 값을 버리지 않는다."""
         rows = K.fetch_day(TARGET, sample_path=sample)
-        assert all(abs(r.ghi_mj - r.acc_mj) < 1e-6 for r in rows)
+        assert rows[0].inst_gap == pytest.approx(0.54 - 1.0, abs=1e-6)
+
+    def test_decreasing_accumulation_is_dropped_not_clipped(self, tmp_path):
+        """누적장이 줄어들면 모델 재시작 등으로 초기화된 것이다. 0으로 깎으면 안 된다."""
+        tmfc = K.default_tmfc(TARGET)
+        hfs = sorted({K.hf_for(TARGET, h, tmfc) for h in range(1, 25)}
+                     | {K.hf_for(TARGET, 1, tmfc) - 1})
+        acc = {hf: 1.0 * (hf - hfs[0]) for hf in hfs}
+        acc[hfs[12]] = 0.0                                   # 중간에서 초기화된 상황
+        p = tmp_path / "reset.txt"
+        p.write_text("\n".join(_block(hf, 100.0, 50.0, acc[hf]) for hf in hfs), encoding="utf-8")
+        errs: list[str] = []
+        rows = K.fetch_day(TARGET, sample_path=str(p), errors=errs)
+        assert len(rows) < 24 and any("감소" in e for e in errs), errs
+        assert all(r.ghi_mj >= 0 for r in rows)
 
     def test_hub_height_wind_is_the_vector_magnitude(self, sample):
         rows = K.fetch_day(TARGET, sample_path=sample)
