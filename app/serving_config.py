@@ -129,3 +129,39 @@ def artifact_name(energy_type: str, use_demand: bool, use_cross: bool,
 def features_for(key: str, features: list[str]) -> list[str]:
     drop = FEATURE_DROP.get(key, ())
     return [f for f in features if f not in drop]
+
+
+# ---------------------------------------------------------------------------
+# 밴드 바닥값 — '오늘은 위험 시간 없음'을 표시할 수 있게 하는 상수
+# ---------------------------------------------------------------------------
+# 대시보드는 하루 24시간 안에서 순위를 매겨 등급을 만든다. 순위는 정의상 척도를 지우므로
+# 제어가 전혀 없는 날에도 1등이 존재하고 그것이 '매우 높음'으로 표시된다 — 2023년 테스트에서
+# 무제어일 248일 전부에 경보가 떴다. 바닥값은 그 아래면 아무것도 표시하지 않게 해 이를 막는다.
+#
+# 선정 기준: 조용해진 날 중 실제 제어일이 2%를 넘지 않는 가장 높은 값.
+# 제어일을 놓치는 비용(흡수 못 한 MWh)이 헛걸음 비용보다 크므로 재현율 쪽으로 기울였다.
+# 선정 구간은 학습+보정이고 테스트 구간은 보지 않는다. 근거: app/training/select_band_floor.py
+# 산출물: models/band_floors.csv
+#
+# 경로마다 값이 다른 이유는 확률 척도가 경로마다 다르기 때문이다(같은 임계값에서 발화율 9배 차이).
+BAND_FLOOR: dict[str, float] = {
+    "solar": 0.070,
+    "solar_demand": 0.060,
+    "wind": 0.035,                 # 신뢰 불가 — 아래 BAND_FLOOR_RELIABLE 참고
+    "wind_demand": 0.095,
+    "wind_demand_crossp": 0.320,
+}
+
+# wind 단독 경로는 PR-AUC 0.391로 애초에 '제어일 판별'을 못 한다. 놓침 2% 제약을 지키는
+# 바닥값이 0.035에 머물러 조용한 날이 730일 중 2일뿐이다(주경로는 318일). 억지로 올리면
+# 제어일을 통째로 놓친다(0.10에서 9.0%, 0.30에서 16.2%). 그래서 이 경로에서는 바닥값을
+# 적용하지 않고 기존 방식을 유지하며, 화면에 한계를 표시한다.
+BAND_FLOOR_RELIABLE: dict[str, bool] = {
+    "solar": True, "solar_demand": True, "wind": False,
+    "wind_demand": True, "wind_demand_crossp": True,
+}
+
+
+def band_floor(key: str) -> tuple[float, bool]:
+    """(바닥값, 신뢰 가능 여부). 신뢰 불가면 호출부가 바닥값을 적용하지 말아야 한다."""
+    return BAND_FLOOR.get(key, 0.0), BAND_FLOOR_RELIABLE.get(key, False)

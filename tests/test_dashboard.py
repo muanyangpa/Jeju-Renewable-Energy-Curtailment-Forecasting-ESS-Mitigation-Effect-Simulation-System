@@ -68,6 +68,58 @@ def test_등급은_세_밴드뿐이다(app):
     assert mod.band_of(10, 24) == "그 외"
 
 
+def test_바닥값_아래는_등급이_눌린다():
+    """순위만 쓰면 무제어일에도 '매우 높음'이 뜬다 — 2023년 무제어일 248일 전부가 그랬다.
+
+    바닥값 아래를 '그 외'로 눌러야 '오늘은 위험 시간 없음'이 표시될 수 있다.
+    """
+    import pandas as pd
+    import dashboard.app as mod
+    from app.serving_config import band_floor
+
+    floor, ok = band_floor("wind_demand_crossp")
+    assert ok, "주경로 바닥값은 신뢰 가능해야 한다"
+    # 전부 바닥값 미만인 하루 — 순위상 1등은 있지만 등급은 모두 '그 외'여야 한다
+    quiet = pd.DataFrame({"curtailment_probability": [floor * 0.5] * 24})
+    out, f, r = mod.apply_bands(quiet, "wind_demand_crossp")
+    assert set(out["밴드"]) == {"그 외"}, out["밴드"].value_counts().to_dict()
+    assert f == floor and r is True
+    # 바닥값을 넘는 시간이 있으면 정상적으로 등급이 매겨진다
+    loud = quiet.copy()
+    loud.loc[12, "curtailment_probability"] = 0.9
+    out2, _, _ = mod.apply_bands(loud, "wind_demand_crossp")
+    assert out2.loc[12, "밴드"] == "상위 5%"
+    assert (out2.drop(index=12)["밴드"] == "그 외").all()
+
+
+def test_신뢰불가_경로는_바닥값을_적용하지_않는다():
+    """wind 단독은 PR-AUC 0.391로 제어일 판별을 못 한다 — 바닥값을 올리면 제어일을 놓친다.
+
+    그 경로에서는 기존 순위 방식을 유지하고, 대신 화면에 한계를 표시한다.
+    """
+    import pandas as pd
+    import dashboard.app as mod
+    from app.serving_config import band_floor
+
+    floor, ok = band_floor("wind")
+    assert not ok, "wind 단독 경로는 신뢰 불가로 표기돼 있어야 한다"
+    quiet = pd.DataFrame({"curtailment_probability": [floor * 0.5] * 24})
+    out, _, r = mod.apply_bands(quiet, "wind")
+    assert r is False
+    assert "상위 5%" in set(out["밴드"]), "신뢰 불가 경로는 순위 방식을 그대로 써야 한다"
+
+
+def test_경로키를_모델이름에서_되찾는다():
+    """화면에서 조건을 재조합해 추측하면 서버의 자동 전환과 어긋나 바닥값이 잘못 적용된다."""
+    import dashboard.app as mod
+    from app.serving_config import PATH_KEYS, artifact_name
+
+    for et, ud, uc in (("solar", False, False), ("solar", True, False), ("wind", False, False),
+                       ("wind", True, False), ("wind", True, True)):
+        name = artifact_name(et, ud, uc)
+        assert mod.path_from_model(name) in PATH_KEYS, name
+
+
 def test_ESS_패널은_실측_제어량을_쓴다(app):
     """예측 기댓값을 넣으면 흡수율이 실측 36.8% 대비 80.6%로 과대평가된다(README 알려진 한계).
 

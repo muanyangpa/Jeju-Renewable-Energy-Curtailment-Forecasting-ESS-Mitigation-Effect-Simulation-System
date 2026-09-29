@@ -30,6 +30,7 @@ import pandas as pd
 import streamlit as st
 
 from app.schemas import EssSimulateRequest, PredictRequest
+from app.serving_config import PATH_KEYS, band_floor
 from app.services import ess_simulation
 from app.services.predict import predict
 
@@ -95,6 +96,27 @@ def band_of(rank: int, n: int) -> str:
     return "그 외"
 
 
+def apply_bands(df: pd.DataFrame, key: str) -> tuple[pd.DataFrame, float, bool]:
+    """일내 순위 + 바닥값으로 등급을 만든다.
+
+    [왜 바닥값이 필요한가]
+    순위는 정의상 척도를 지운다. 제어가 전혀 없는 날에도 1등은 존재하므로, 순위만 쓰면
+    무제어일에도 '매우 높음'이 뜬다 — 2023년 테스트에서 무제어일 248일 **전부**가 그랬다.
+    바닥값 아래는 전부 '낮음'으로 눌러 '오늘은 위험 시간 없음'이 표시될 수 있게 한다.
+    2023년 기준 주경로에서 오경보일 100% -> 19%, 정밀도 28.5% -> 66.8%.
+
+    신뢰 불가 경로(wind 단독)에서는 바닥값을 적용하지 않는다 — 그 경로는 제어일 판별을
+    못 해서 바닥값을 올리면 제어일을 통째로 놓친다(README '밴드 바닥값').
+    """
+    floor, reliable = band_floor(key)
+    order = df["curtailment_probability"].rank(ascending=False, method="first").astype(int) - 1
+    bands = [band_of(r, len(df)) for r in order]
+    if reliable:
+        bands = [b if p >= floor else "그 외"
+                 for b, p in zip(bands, df["curtailment_probability"])]
+    return df.assign(밴드=bands), floor, reliable
+
+
 # ---------------------------------------------------------------------------
 # 사이드바
 # ---------------------------------------------------------------------------
@@ -130,8 +152,23 @@ req = PredictRequest(
 res = predict(req)
 
 df = pd.DataFrame([h.model_dump() for h in res.hourly])
-order = df["curtailment_probability"].rank(ascending=False, method="first").astype(int) - 1
-df["밴드"] = [band_of(r, len(df)) for r in order]
+def path_from_model(model_used: str) -> str:
+    """서버가 실제로 쓴 모델 이름에서 경로 키를 얻는다.
+
+    화면에서 조건을 다시 조합해 추측하면 서버의 자동 전환(태양광 기상값이 오면 계통 전체
+    침투율 모델로 바뀐다)과 어긋난다. 바닥값이 다른 경로 것으로 적용되면 조용히 틀린다.
+    """
+    k = model_used.removeprefix("classifier_")
+    for suf in ("_calibrated_sigmoid", "_calibrated_isotonic"):
+        k = k.removesuffix(suf)
+    k = k.removesuffix("_lr")
+    if k not in PATH_KEYS:
+        raise ValueError(f"알 수 없는 경로: {model_used} -> {k}")
+    return k
+
+
+PATH = path_from_model(res.model_used)
+df, FLOOR, FLOOR_OK = apply_bands(df, PATH)
 
 tab_ops, tab_ess, tab_val = st.tabs(["하루전 위험 예측", "ESS 완화효과 (설비 검토)", "검증 리포트"])
 
@@ -156,7 +193,8 @@ with tab_ops:
 
     c1, c2, c3 = st.columns(3)
     top5 = df[df["밴드"] == "상위 5%"]["hour"].tolist()
-    c1.metric("매우 높음 (상위 5%)", f"{len(top5)}시간", ", ".join(f"{h}시" for h in top5) or "없음")
+    c1.metric("매우 높음", f"{len(top5)}시간",
+              ", ".join(f"{h}시" for h in top5) or "오늘은 없음", delta_color="off")
     c2.metric("발전량 예측 합계", f"{df['generation_forecast_mwh'].sum():,.0f} MWh")
     c3.metric("사용 모델", res.model_used.replace("classifier_", "").replace("_calibrated_sigmoid", ""))
 
@@ -164,7 +202,15 @@ with tab_ops:
     st.bar_chart(chart.set_index("hour")["generation_forecast_mwh"], height=220,
                  y_label="발전량 예측 (MWh)", x_label="시각 (구간의 끝)")
 
-    st.markdown("**시간별 위험 등급** — 절대 확률이 아니라 그날 24시간 안에서의 순위 밴드입니다.")
+    if FLOOR_OK:
+        st.markdown("**시간별 위험 등급** — 그날 24시간 안에서의 순위 밴드이되, "
+                    f"**바닥값({FLOOR:.3f}) 미만은 표시하지 않습니다.** "
+                    "그래서 위험한 시간이 없는 날은 전부 '낮음'으로 나옵니다.")
+    else:
+        st.warning(f"**이 경로({PATH})는 바닥값을 쓸 수 없습니다.** 제어일 판별 성능이 낮아"
+                   "(PR-AUC 0.391) 바닥값을 올리면 제어일을 통째로 놓칩니다. 지금 화면은 "
+                   "하루 안 순위만 쓰므로 **위험이 없는 날에도 등급이 표시됩니다.** "
+                   "수요예측을 켜면 이 문제가 없는 경로로 전환됩니다.")
     view = df[["hour", "generation_forecast_mwh", "밴드"]].copy()
     view.columns = ["시각", "발전량 예측 (MWh)", "위험 등급"]
     view["위험 등급"] = [f"{BAND_STYLE[b][1]} ({b})" for b in df["밴드"]]
