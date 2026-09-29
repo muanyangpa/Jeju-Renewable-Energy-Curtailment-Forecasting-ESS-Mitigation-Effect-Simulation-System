@@ -56,6 +56,8 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from app.services.credentials import resolve_secret, setup_hint
+
 ENDPOINT = "https://apihub.kma.go.kr/api/typ06/cgi-bin/url/nph-kim_nc_pt_txt2_std"
 GROUP, NWP, DATA = "KIML", "L010", "U"
 NAMES = ("SWDDIR2", "SWDDIF2", "ACSWDNB", "U80", "V80", "T2")
@@ -167,9 +169,10 @@ def fetch_day(target: dt.date, lat: float = 33.5141, lon: float = 126.5297,
     if sample_path:
         raw = load_sample(sample_path)
     else:
-        key = key or os.environ.get("KMA_AUTH_KEY")
+        key = key or resolve_secret("KMA_AUTH_KEY")
         if not key:
-            raise RuntimeError("KMA_AUTH_KEY 환경변수가 필요합니다")
+            raise RuntimeError("KMA_AUTH_KEY를 찾지 못했습니다 (환경변수·키체인 모두 없음).\n"
+                               + setup_hint("KMA_AUTH_KEY"))
         ctx = _ctx()
 
         def job(hf: int):

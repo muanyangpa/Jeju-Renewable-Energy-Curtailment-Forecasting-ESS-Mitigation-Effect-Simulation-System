@@ -37,6 +37,7 @@ import pandas as pd
 from app.data_prep import add_time_features
 from app.model_io import load_artifact
 from app.services import kim_forecast
+from app.services.credentials import resolve_secret, setup_hint
 from app.solar_radiation import add_solar_geometry, cloud_from_sky, latlon_to_grid
 
 # 같은 서비스(VilageFcstInfoService_2.0 / 동네예보 > 단기예보조회)를 두 포털이 각자 제공한다.
@@ -157,20 +158,24 @@ def _ssl_context():
 
 
 def resolve_key(portal: str | None = None, key: str | None = None) -> tuple[str, str]:
-    """(포털 이름, 인증키). 환경변수에서 찾고, 없으면 무엇을 해야 하는지 알려주며 실패한다."""
+    """(포털 이름, 인증키). 환경변수 -> macOS 키체인 순으로 찾는다.
+
+    키체인을 함께 보는 이유는 매일 도는 자동 수집(scripts/kim_validation_log.py) 때문이다 —
+    cron/launchd는 로그인 셸을 거치지 않아 ~/.zshrc의 export가 보이지 않는다.
+    """
     if portal and portal not in PORTALS:
         raise ValueError(f"portal은 {list(PORTALS)} 중 하나여야 합니다 (받은 값: {portal!r})")
     if key:
         return portal or "apihub", key
     order = [portal] if portal else list(PORTALS)
     for name in order:
-        env = PORTALS[name]["env"]
-        v = os.environ.get(env)
+        v = resolve_secret(PORTALS[name]["env"])
         if v:
-            return name, v.strip()
-    lines = [f"  export {PORTALS[n]['env']}=발급받은키    # {PORTALS[n]['label']}" for n in order]
-    raise RuntimeError("기상청 인증키를 찾지 못했습니다. 아래 중 하나를 환경변수로 넣으세요.\n"
-                       + "\n".join(lines))
+            return name, v
+    labels = "\n".join(f"  {PORTALS[n]['env']:18} {PORTALS[n]['label']}" for n in order)
+    raise RuntimeError(
+        "기상청 인증키를 찾지 못했습니다 (환경변수·키체인 모두 없음).\n"
+        f"쓸 수 있는 이름:\n{labels}\n\n" + setup_hint(PORTALS[order[0]]["env"]))
 
 
 def fetch(target: date, lat: float = 33.5141, lon: float = 126.5297,
