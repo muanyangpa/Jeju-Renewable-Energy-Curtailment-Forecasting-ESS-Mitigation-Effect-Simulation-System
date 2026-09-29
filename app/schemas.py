@@ -8,6 +8,11 @@ Backend(Java/Spring Boot) <-> AI 서버(Python) REST 계약.
   - Backend: 필드 존재 여부·기본 타입만 확인 (JSON 파싱 레벨)
   - AI 서버: 도메인 규칙 검증 — "weather 배열이 정확히 24개, 시간 중복 없음" 등
     위반 시 HTTP 422 + error_code="INVALID_HOUR_SET"
+  - AI 서버: 발전원별 필수 기상값 누락 검증 [신규]
+    위반 시 HTTP 422 + error_code="MISSING_REQUIRED_FIELD"
+    (수정 전에는 누락값을 조용히 0으로 바꿔 예측했다 — 예: 풍속 null -> 풍속 0 -> '제어 없음'으로 오예측)
+
+에러 메시지 규약: ValueError("<ERROR_CODE>:<사람이 읽는 메시지>") — main.py가 코드와 메시지를 분리한다.
 """
 from __future__ import annotations
 
@@ -17,6 +22,12 @@ from typing import Literal, Optional
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 EnergyType = Literal["solar", "wind"]
+
+# 발전원별 컨버터 필수 입력 (app/training/train_converter.py의 피처와 일치해야 함)
+REQUIRED_WEATHER_FIELDS: dict[str, tuple[str, ...]] = {
+    "solar": ("solar_rad", "temp", "cloud"),
+    "wind": ("wind_speed",),
+}
 
 
 class WeatherHour(BaseModel):
@@ -34,7 +45,7 @@ class PredictRequest(BaseModel):
     target_date: date
     weather: list[WeatherHour] = Field(..., description="정확히 24개, 1~24시 각 1회")
     demand_forecast_mw: Optional[list[float]] = Field(
-        None, description="24개, 풍력 전용(수요 정식 채택 피처, 05장). 태양광은 무시됨"
+        None, description="24개(선택). 있으면 침투율(발전량/수요) 포함 모델을 사용한다 — 태양광·풍력 모두 정확도가 올라간다(태양광 PR-AUC 0.639->0.711). 풍력은 수요 자체도 정식 피처다(05장). 생략하면 미포함 모델로 자동 전환되고 풍력의 expected_curtailment_mwh는 null이 된다"
     )
 
     @field_validator("weather")
@@ -53,13 +64,40 @@ class PredictRequest(BaseModel):
             raise ValueError("INVALID_HOUR_SET:demand_forecast_mw는 24개여야 합니다")
         return self
 
+    @model_validator(mode="after")
+    def _check_required_weather(self) -> "PredictRequest":
+        required = REQUIRED_WEATHER_FIELDS[self.energy_type]
+        missing = sorted(
+            {f"{w.hour}시.{f}" for w in self.weather for f in required if getattr(w, f) is None},
+            key=lambda s: (int(s.split("시")[0]), s),
+        )
+        if missing:
+            preview = ", ".join(missing[:5]) + (f" 외 {len(missing) - 5}건" if len(missing) > 5 else "")
+            raise ValueError(
+                f"MISSING_REQUIRED_FIELD:{self.energy_type} 예측에는 {', '.join(required)}가 모든 시간에 필요합니다 "
+                f"(누락: {preview})"
+            )
+        return self
+
 
 class HourlyPrediction(BaseModel):
     hour: int
     generation_forecast_mwh: float
-    curtailment_probability: float
+    curtailment_probability: float = Field(
+        ..., description="출력제어 발생 확률 0~1. sigmoid 보정된 값이라 보정 전 모델과 크기가 "
+                         "다르다. 0.5 같은 고정 임계값을 쓰지 말 것(README '운영 임계값' 참고). "
+                         "산출 모델은 model_used 참고"
+    )
     expected_curtailment_mwh: Optional[float] = Field(
-        None, description="풍력만 값 존재. 태양광은 07장 사유로 null 고정"
+        None,
+        description=(
+            "제어량 기댓값 = curtailment_probability x E[제어량|제어 발생] (2단계 모델). "
+            "같은 확률을 쓰므로 expected_curtailment_mwh / curtailment_probability = 조건부 제어량이 된다. "
+            "풍력 + demand_forecast_mw가 있을 때만 값이 존재하고, 태양광은 07장 사유로 null 고정. "
+            "⚠ 이 값은 '기댓값'이라 개별 시간의 제어량 크기가 아니다 — /ess/simulate의 "
+            "hourly_curtailment_mwh로 넘기지 말 것. 2023년 검증에서 ESS 흡수율이 "
+            "실측 36.8% 대비 80.6%로 과대평가됐다(README '알려진 한계')."
+        ),
     )
 
 
@@ -68,6 +106,26 @@ class PredictResponse(BaseModel):
     region: str
     target_date: date
     hourly: list[HourlyPrediction]
+    model_used: str = Field(
+        ..., description="curtailment_probability를 산출한 sigmoid 보정 모델 이름. "
+                         "demand_forecast_mw가 있으면 'classifier_{solar|wind}_demand_calibrated_sigmoid', "
+                         "없으면 'classifier_{solar|wind}_calibrated_sigmoid'. "
+                         "값을 하드코딩해 분기하지 말 것 — 보정 방식이 바뀌면 이름도 바뀐다"
+    )
+    operational_threshold: Optional[float] = Field(
+        None,
+        description=(
+            "이 model_used에 대해 선정된 '제어 발생 경보' 임계값. curtailment_probability가 이 값 "
+            "이상이면 경보로 취급한다. **하드코딩하지 말고 이 값을 쓸 것** — 확률 척도는 모델의 "
+            "피처 구성과 보정 매핑이 함께 만들므로 경로마다 다르다(0.02~0.43). "
+            "operational_threshold_reliable이 false면 표본이 부족해 신뢰할 수 없으니 임계값 판정 "
+            "대신 등급(상위 5%)으로 표시할 것. 선정 절차는 app/training/select_thresholds.py."
+        ),
+    )
+    operational_threshold_reliable: Optional[bool] = Field(
+        None,
+        description="임계값 선정 구간의 양성 표본이 충분했는지(50건 이상). false면 임계값 판정 금지",
+    )
     note: Optional[str] = Field(
         None, description="태양광 응답에는 expected_curtailment_mwh가 null인 이유를 항상 포함"
     )
@@ -75,8 +133,28 @@ class PredictResponse(BaseModel):
 
 class EssSimulateRequest(BaseModel):
     hourly_curtailment_mwh: list[float] = Field(..., description="시간별 출력제어량(MWh), 24개 또는 임의 길이")
-    rated_power_mw: float = Field(22.5, description="ESS 정격출력(MW) — 04장 03번 슬라이더 값")
-    method: Literal["hourly_capped", "naive_upper_bound"] = "hourly_capped"
+    rated_power_mw: float = Field(65.0, description="ESS 정격출력(MW) — 04장 03번 슬라이더 1축. 기본값은 제주 장주기 BESS 중앙계약시장 물량")
+    method: Literal["storage_constrained", "hourly_capped", "naive_upper_bound"] = "storage_constrained"
+    # --- method="storage_constrained" 전용 (저장용량 제약 반영) ---
+    energy_capacity_mwh: float | None = Field(
+        None, description="ESS 저장용량(MWh) — 슬라이더 2축. 미지정 시 rated_power_mw × 4시간(제주 BESS 기준)"
+    )
+    round_trip_efficiency: float = Field(0.90, gt=0.0, le=1.0, description="왕복효율 — 상용 BESS AC 85~94% 중앙값")
+    soc_min: float = Field(0.10, ge=0.0, lt=1.0, description="최소 충전상태 [가정]")
+    soc_max: float = Field(0.90, gt=0.0, le=1.0, description="최대 충전상태 [가정]")
+    hour_of_day: list[int] | None = Field(
+        None, description="각 시간의 시각(1~24). 미지정 시 1시부터 시작하는 연속 시계열로 간주"
+    )
+
+    @model_validator(mode="after")
+    def _check_storage(self):
+        if self.soc_min >= self.soc_max:
+            raise ValueError("INVALID_SOC_RANGE:soc_min이 soc_max보다 작아야 합니다")
+        if self.energy_capacity_mwh is not None and self.energy_capacity_mwh <= 0:
+            raise ValueError("INVALID_ENERGY_CAPACITY:저장용량은 0보다 커야 합니다")
+        if self.hour_of_day is not None and len(self.hour_of_day) != len(self.hourly_curtailment_mwh):
+            raise ValueError("LENGTH_MISMATCH:hour_of_day 길이가 hourly_curtailment_mwh와 같아야 합니다")
+        return self
 
 
 class EssSimulateResponse(BaseModel):
@@ -85,6 +163,11 @@ class EssSimulateResponse(BaseModel):
     total_curtailment_mwh: float
     total_absorbed_mwh: float
     absorption_rate: float
+    # storage_constrained에서만 채워진다 (정격출력만 쓰는 방식은 저장용량 개념이 없음)
+    energy_capacity_mwh: float | None = None
+    usable_capacity_mwh: float | None = None
+    hours_full: int | None = Field(None, description="ESS가 가득 차서 더 흡수하지 못한 시간 수")
+    annual_cycles: float | None = Field(None, description="가용용량 기준 환산 사이클 수")
 
 
 class ErrorResponse(BaseModel):

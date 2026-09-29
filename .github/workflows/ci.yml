@@ -1,0 +1,35 @@
+# 순수 로직 테스트만 돌린다.
+# 원본 데이터(data/)와 학습된 모델(models/)은 .gitignore 대상이라 CI에 없다 — 그것들이
+# 필요한 테스트는 tests/conftest.py가 skip으로 표시한다. '통과'가 아니라 'skipped'로
+# 보여야 CI가 아무것도 검증하지 않는데 초록불이 뜨는 일을 막을 수 있다.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"   # 아티팩트를 학습한 버전과 맞춘다 (requirements.txt 주석 참고)
+          cache: pip
+      - run: pip install -r requirements.txt pytest
+      - name: pytest (아티팩트 필요 테스트는 skip)
+        run: python -m pytest tests/ -v --tb=short -rs
+
+  backend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"       # pom.xml의 release 버전
+          cache: maven
+      - run: mvn -B -ntp compile
+        working-directory: backend
