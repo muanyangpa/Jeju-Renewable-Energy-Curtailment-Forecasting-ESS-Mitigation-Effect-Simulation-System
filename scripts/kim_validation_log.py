@@ -63,12 +63,19 @@ def collect(target: dt.date) -> None:
         "collected_at": dt.datetime.now().isoformat(timespec="seconds")} for r in rows])[COLS]
 
     if os.path.exists(LOG):
-        old = pd.read_csv(LOG)
+        # tmfc는 반드시 문자열로 읽는다. 기본 추론이면 int64가 되어 문자열 비교가 절대
+        # 성립하지 않고, 같은 날을 두 번 수집하면 중복이 그대로 쌓인다(실제로 겪었다).
+        old = pd.read_csv(LOG, dtype={"tmfc": str, "target_date": str})
         dup = (old["target_date"] == target.isoformat()) & (old["tmfc"] == tmfc)
         if dup.any():
-            print(f"이미 기록돼 있습니다 ({target} / tmfc={tmfc}) — 덮어씁니다.")
+            print(f"이미 기록돼 있습니다 ({target} / tmfc={tmfc}) — {int(dup.sum())}행을 덮어씁니다.")
             old = old[~dup]
         new = pd.concat([old, new], ignore_index=True)
+    # 같은 (거래일, tmfc, 시각)이 두 번 들어오면 마지막 수집만 남긴다
+    before = len(new)
+    new = new.drop_duplicates(subset=["target_date", "tmfc", "hour"], keep="last")
+    if len(new) < before:
+        print(f"중복 {before - len(new)}행을 정리했습니다.")
     os.makedirs(os.path.dirname(LOG), exist_ok=True)
     new.to_csv(LOG, index=False)
     days = new["target_date"].nunique()
@@ -80,7 +87,11 @@ def collect(target: dt.date) -> None:
 def report() -> None:
     if not os.path.exists(LOG):
         sys.exit(f"기록이 없습니다: {LOG}\n먼저 collect를 며칠 돌려야 합니다.")
-    log = pd.read_csv(LOG)
+    log = pd.read_csv(LOG, dtype={"tmfc": str, "target_date": str})
+    dup = int(log.duplicated(subset=["target_date", "tmfc", "hour"]).sum())
+    if dup:
+        print(f"⚠ 중복 {dup}행이 있습니다 — collect를 한 번 더 돌리면 정리됩니다.")
+        log = log.drop_duplicates(subset=["target_date", "tmfc", "hour"], keep="last")
     log["dt"] = (pd.to_datetime(log["target_date"])
                  + pd.to_timedelta(log["hour"], unit="h"))
     print(f"예보 기록 {log['target_date'].nunique()}일 / {len(log)}행 "

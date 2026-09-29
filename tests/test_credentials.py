@@ -13,6 +13,10 @@ from app.services import credentials as C
 
 SECRET = "SECRET-TEST-VALUE-1234"
 
+# conftest의 _no_real_credentials가 from_keychain을 전역으로 막는다. 아래 TestKeychainCall은
+# 그 함수 자체를 시험하므로 원본을 잡아 두었다가 되돌린다 — 임포트 시점이라 아직 원본이다.
+_REAL_FROM_KEYCHAIN = C.from_keychain
+
 
 def test_환경변수가_키체인을_이긴다(monkeypatch):
     """일회성 override가 가능해야 한다 — 다른 키로 한 번만 시험할 때 쓴다."""
@@ -44,6 +48,21 @@ def test_키체인_서비스_이름은_기본이_환경변수명(monkeypatch):
 
 
 class TestKeychainCall:
+    """from_keychain 자체를 시험한다 — conftest의 전역 차단을 이 클래스에서만 되돌린다.
+
+    되돌리지 않으면 아래 테스트들이 스텁의 None을 받아 **무의미하게 통과한다**
+    (기대값이 마침 None인 세 건이 실제로 그랬다). 각 테스트가 subprocess.run을 대체하므로
+    되돌려도 실제 키체인에는 닿지 않는다.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _restore(self, monkeypatch):
+        monkeypatch.setattr(C, "from_keychain", _REAL_FROM_KEYCHAIN)
+
+    def test_원본_함수를_시험하고_있다(self):
+        """전역 스텁이 되살아나면 이 클래스 전체가 의미를 잃으므로 그것부터 확인한다."""
+        assert C.from_keychain is _REAL_FROM_KEYCHAIN
+
     def test_셸_없이_리스트_인자로_부른다(self, monkeypatch):
         """서비스 이름에 셸 메타문자가 들어가도 안전해야 한다."""
         calls = []

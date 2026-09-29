@@ -152,3 +152,37 @@ class TestOverrideIsAllOrNothing:
         monkeypatch.delenv("KMA_AUTH_KEY", raising=False)
         with pytest.raises(RuntimeError, match="KMA_AUTH_KEY"):
             K.fetch_day(TARGET)
+
+
+class TestValidationLog:
+    """수집 기록의 중복 제거 — 14일치를 쌓는 동안 조용히 오염되면 검증이 무의미해진다."""
+
+    def _log(self, tmp_path, monkeypatch):
+        import scripts.kim_validation_log as L
+        p = tmp_path / "log.csv"
+        monkeypatch.setattr(L, "LOG", str(p))
+        return L, p
+
+    def test_tmfc를_문자열로_읽는다(self, tmp_path, monkeypatch):
+        """CSV 기본 추론이면 int64가 되어 문자열 비교가 절대 성립하지 않는다.
+
+        그러면 같은 날을 두 번 수집해도 중복 제거가 안 되고 그대로 쌓인다 — 실제로 겪었다.
+        """
+        import pandas as pd
+        L, p = self._log(tmp_path, monkeypatch)
+        pd.DataFrame({"target_date": ["2026-09-30"] * 2, "hour": [1, 2],
+                      "tmfc": ["2026092818"] * 2, "kim_mj": [0.0, 0.0],
+                      "kim_inst_mj": [0.0, 0.0], "est_mj": [0.0, 0.0],
+                      "wind80": [1.0, 1.0], "temp_c": [20.0, 20.0],
+                      "collected_at": ["x", "x"]}).to_csv(p, index=False)
+        got = pd.read_csv(p, dtype={"tmfc": str, "target_date": str})
+        assert got["tmfc"].dtype == object
+        assert (got["tmfc"] == "2026092818").all(), "문자열로 읽어야 비교가 성립한다"
+
+    def test_같은_시각이_두_번_들어오면_마지막만_남는다(self, tmp_path):
+        import pandas as pd
+        d = pd.DataFrame({"target_date": ["2026-09-30"] * 3, "tmfc": ["2026092818"] * 3,
+                          "hour": [1, 1, 2], "kim_mj": [0.1, 0.2, 0.3]})
+        out = d.drop_duplicates(subset=["target_date", "tmfc", "hour"], keep="last")
+        assert len(out) == 2
+        assert out[out.hour == 1]["kim_mj"].iloc[0] == 0.2, "나중 수집이 이겨야 한다"
