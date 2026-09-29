@@ -15,11 +15,16 @@ import java.time.LocalDateTime;
  * 실제 응답에 없어 제거함 (이전 확정서 v1.0 문서 기준이었으나 구현체와 달라 정정).
  *
  * 2026-09-25 AI 서버 변경(커밋 f7f0525→0787d28) 반영:
- * - curtailmentProbability는 sigmoid 확률 보정이 적용된 값. 0.5 같은 고정 임계값 금지,
- *   제어 발생 판정 기준은 0.03 (Frontend 등급 표시 시 참고).
+ * - curtailmentProbability는 sigmoid 확률 보정이 적용된 값.
  * - note는 SOLAR 전용이 아니라 세 경로 모두 올 수 있음(note 컬럼 주석 참고).
  * - ESS 흡수율 계산에는 curtailmentMwh(예측값)를 쓰지 말 것 - 실측 제어량 기반만 사용
  *   (예측값 사용 시 실측 36.8%가 78%로 부풀려짐, AI 서버팀 확인).
+ *
+ * 2026-09-26 AI 서버 추가 변경 반영:
+ * - 0.03 같은 고정 임계값 사용 금지로 방침 변경. modelUsed별로 operationalThreshold가
+ *   다르게 내려오므로(0.02~0.43, 최대 20배 차이) 응답값을 그대로 저장해서 써야 함.
+ * - operationalThresholdReliable=false인 경우 등급(낮음/보통/높음) 확정 표시 대신
+ *   "상위 5%" 방식으로 대체 표시할 것 (Frontend 작업 시 참고).
  */
 @Entity
 @Table(name = "curtailment_predictions")
@@ -40,7 +45,14 @@ public class CurtailmentPrediction {
     private LocalDateTime targetHour; // 예측 대상 시각
 
     @Column(nullable = false)
-    private double curtailmentProbability; // 출력제어 확률 (0~1)
+    private double curtailmentProbability; // 출력제어 확률 (0~1, sigmoid 보정값)
+
+    @Column(length = 60)
+    private String modelUsed; // 2026-09-26: 5경로 - classifier_{solar,solar_demand,wind,wind_demand,wind_demand_crossp}_calibrated_sigmoid
+
+    private Double operationalThreshold; // 모델별 운영 임계값(0.02~0.43, 최대 20배 차이) - 0.03 고정 사용 금지
+
+    private Boolean operationalThresholdReliable; // false면 임계값 확정 대신 상위 5%로만 표시 (note에도 안내)
 
     private double generationForecastMwh; // 컨버터 산출 발전량 예측치
 
