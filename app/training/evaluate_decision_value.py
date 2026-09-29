@@ -11,9 +11,16 @@
 이 틀에서는 세 가지를 나란히 놓을 수 있다.
   완전예지  — 제어량을 미리 다 안다고 가정한 상한
   모델      — 우리 예측 확률로 고른 경우
-  기후값    — ML 없이 '월×시각 평균 제어율' 표만 보고 고른 경우 (실무자의 현실적 대안)
+  침투율    — 학습 없이 침투율만으로 정렬한 경우 (규정을 읽은 실무자의 대안)
+  기후값    — ML 없이 '월×시각 평균 제어율' 표만 보고 고른 경우 (가장 단순한 대안)
 
-기후값 대비 차이가 이 시스템이 만드는 가치이고, 완전예지 대비 비율이 남은 개선 여지다.
+**두 기준선을 모두 보고한다.** 기후값만 보이면 유리한 쪽만 고른 것이 된다.
+규정 제8.3.1조를 읽은 실무자의 진짜 대안은 침투율이고, 그 대비 차이가 '학습이 더하는 몫'이다.
+차이가 작다는 것이 결론이면 그대로 적는다 — 이 저장소는 숫자를 고르지 않는다.
+
+한 가지는 함께 밝혀야 한다: 침투율은 '실측 발전량 ÷ 실측 수요'라 **하루전에는 계산할 수 없다.**
+그 값을 내일치로 알려면 기상예보를 발전량으로 바꿔야 하고, 그것이 이 시스템의 컨버터다.
+즉 침투율 기준선은 '공식이 이미 주어졌다면'이라는 가정 위에 있다.
 
 [한계]
 - 제어량(MWh)이 집계된 구간이 필요하다. 제주 풍력은 2024-06 제도 전환으로 집계가 끊겼으므로
@@ -90,16 +97,21 @@ def evaluate(energy_type: str, use_demand: bool = True,
     unit = "MWh" if has_mwh else "제어시간"
     total = te["w"].sum()
 
+    # 학습 없는 물리 기준선: 교차원을 쓰는 경로는 합산 침투율, 아니면 자기 침투율
+    pen_col = "total_penetration" if "total_penetration" in te.columns else "penetration"
     days = pd.DatetimeIndex(te.dt).normalize().to_numpy()
     rows = []
     for b in BUDGETS:
         k = int(round(len(te) * b))
         model = te.nlargest(k, "p")["w"].sum()
+        pen = te.nlargest(k, pen_col)["w"].sum()
         clim = te.nlargest(k, "clim")["w"].sum()
         oracle = te.nlargest(k, "w")["w"].sum()
         lo, hi = _coverage_ci(te["w"].to_numpy(), te["p"].to_numpy(), days, b)
         rows.append({
             "model_lo": lo, "model_hi": hi,
+            "penetration_pct": round(pen / total * 100, 1),
+            "model_minus_pen_pp": round((model - pen) / total * 100, 1),
             "energy_type": energy_type, "unit": unit, "n_hours": len(te),
             "total": round(total, 1), "budget_pct": b * 100, "budget_hours": k,
             "model_pct": round(model / total * 100, 1),
@@ -117,11 +129,13 @@ def main() -> pd.DataFrame:
         u = g["unit"].iloc[0]
         print(f"\n[{'풍력' if et == 'wind' else '태양광'}] 테스트 {TEST_START}~{TEST_END} "
               f"· {g['n_hours'].iloc[0]:,}시간 · 총 {g['total'].iloc[0]:,.0f} {u}")
-        print(f"  {'주의 예산':>14} {'모델':>8} {'95% 구간':>16} {'기후값':>8} {'완전예지':>8} {'모델−기후값':>11}")
+        print(f"  {'주의 예산':>14} {'모델':>8} {'95% 구간':>16} {'침투율':>7} {'−침투율':>8}"
+              f" {'기후값':>7} {'−기후값':>8} {'완전예지':>8}")
         for _, r in g.iterrows():
             print(f"  {r.budget_pct:4.0f}% ({r.budget_hours:>4}h) {r.model_pct:7.1f}%"
-                  f"  [{r.model_lo:5.1f}, {r.model_hi:5.1f}] {r.climatology_pct:7.1f}%"
-                  f" {r.oracle_pct:7.1f}% {r.model_minus_clim_pp:+10.1f}%p")
+                  f"  [{r.model_lo:5.1f}, {r.model_hi:5.1f}] {r.penetration_pct:6.1f}%"
+                  f" {r.model_minus_pen_pp:+7.1f}%p {r.climatology_pct:6.1f}%"
+                  f" {r.model_minus_clim_pp:+7.1f}%p {r.oracle_pct:7.1f}%")
     path = os.path.join(MODELS_DIR, "decision_value.csv")
     out.to_csv(path, index=False)
     print(f"\n저장: {path}")
