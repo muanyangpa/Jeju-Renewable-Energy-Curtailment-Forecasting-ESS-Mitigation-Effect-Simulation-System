@@ -31,17 +31,36 @@ REQUIRED_WEATHER_FIELDS: dict[str, tuple[str, ...]] = {
 
 
 class WeatherHour(BaseModel):
-    """시간별 기상예보 1건. hour는 1~24(24시=자정, 원본 공공데이터 관례와 동일)."""
-    hour: int = Field(..., ge=1, le=24, description="1~24시")
-    solar_rad: Optional[float] = Field(None, description="일사량(MJ/m2) — 태양광 필수")
-    temp: Optional[float] = Field(None, description="기온(°C)")
-    cloud: Optional[float] = Field(None, description="전운량(0~10) — 태양광 권장")
-    wind_speed: Optional[float] = Field(None, description="풍속(m/s) — 풍력 필수")
+    """시간별 기상예보 1건. hour는 1~24(24시=자정, 원본 공공데이터 관례와 동일).
+
+    ⚠ **Optional은 '널을 보내도 된다'는 뜻이 아니다.** 타입이 Optional인 이유는 하나의 DTO로
+    두 발전원을 모두 받기 위해서이고(태양광 요청에 wind_speed는 불필요), 실제 필수 여부는
+    energy_type에 따라 결정된다 — REQUIRED_WEATHER_FIELDS 참고.
+
+      energy_type="solar"  ->  solar_rad, temp, cloud 가 24시간 모두 필요
+      energy_type="wind"   ->  wind_speed 가 24시간 모두 필요
+
+    한 시간이라도 null이면 422 MISSING_REQUIRED_FIELD이고, 메시지에 누락 위치가 `13시.solar_rad`
+    형태로 최대 5건까지 들어간다. 조용히 0으로 대체하지 않는다 — 풍속 null을 0으로 바꾸면
+    '제어 없음'으로 오예측한다(이 동작을 실제로 겪어 고쳤다).
+    """
+    hour: int = Field(..., ge=1, le=24, description="1~24시 (24시 = 자정)")
+    solar_rad: Optional[float] = Field(None, description="일사량(MJ/m2) — solar일 때 필수, wind일 때 선택")
+    temp: Optional[float] = Field(None, description="기온(°C) — solar일 때 필수, wind일 때 선택")
+    cloud: Optional[float] = Field(None, description="전운량(0~10) — solar일 때 필수, wind일 때 선택")
+    wind_speed: Optional[float] = Field(None, description="풍속(m/s) — wind일 때 필수, solar일 때 선택")
 
 
 class PredictRequest(BaseModel):
     energy_type: EnergyType
-    region: str = Field(..., description="예: '남원읍' — 참고용, 모델 선택에는 미사용(province-wide 모델)")
+    region: str = Field(
+        ..., min_length=1, max_length=100,
+        description=(
+            "관측/발전 지역 표기. **형식 제약 없는 자유 문자열**이고 응답에 그대로 되돌려준다. "
+            "모델은 제주 전역 단일 모델이라 이 값으로 분기하지 않는다 — 즉 '제주', '남원읍', "
+            "'제주특별자치도 서귀포시 남원읍' 모두 같은 예측을 낸다. Backend는 화면 표시에 쓸 "
+            "문자열을 그대로 보내면 된다. 빈 문자열·공백만 있는 값은 거부한다(422)."
+        ))
     target_date: date
     weather: list[WeatherHour] = Field(..., description="정확히 24개, 1~24시 각 1회")
     demand_forecast_mw: Optional[list[float]] = Field(
@@ -56,6 +75,14 @@ class PredictRequest(BaseModel):
         hours = sorted(h.hour for h in v)
         if hours != list(range(1, 25)):
             raise ValueError("INVALID_HOUR_SET:weather 배열의 시간이 1~24시 각 1회가 아닙니다(중복 또는 누락)")
+        return v
+
+    @field_validator("region")
+    @classmethod
+    def _check_region(cls, v: str) -> str:
+        # 값 자체는 쓰지 않지만 빈 값을 받아 그대로 echo하면 화면에 빈칸이 뜬다.
+        if not v.strip():
+            raise ValueError("MISSING_REQUIRED_FIELD:region은 비어 있을 수 없습니다")
         return v
 
     @model_validator(mode="after")

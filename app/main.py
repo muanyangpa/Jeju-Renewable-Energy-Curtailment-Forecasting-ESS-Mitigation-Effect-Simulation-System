@@ -42,6 +42,12 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
     first = exc.errors()[0]
     raw_msg = str(first.get("msg", ""))
     code, msg = _error_code_from_message(raw_msg.replace("Value error, ", ""))
+    # pydantic 기본 메시지("Field required")는 어느 필드인지 말해주지 않는다 — 위치를 붙인다.
+    # Backend가 422를 그대로 릴레이하므로 여기서 안 붙이면 사용자도 원인을 알 수 없다.
+    if code == "VALIDATION_ERROR":
+        loc = ".".join(str(x) for x in first.get("loc", ()) if x != "body")
+        if loc:
+            msg = f"{msg} (위치: {loc})"
     return JSONResponse(status_code=422, content={"error_code": code, "message": msg})
 
 
