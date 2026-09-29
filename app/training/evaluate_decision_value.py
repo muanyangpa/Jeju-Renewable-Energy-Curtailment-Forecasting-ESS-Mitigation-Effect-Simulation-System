@@ -35,6 +35,7 @@ from app.serving_config import artifact_name
 from app.training.train_classifier import TEST_END, TEST_START, TRAIN_END, build_dataset
 
 BUDGETS = (0.02, 0.05, 0.10, 0.20)
+N_BOOT = 2000
 
 
 def _climatology(tr: pd.DataFrame, te: pd.DataFrame) -> np.ndarray:
@@ -43,6 +44,33 @@ def _climatology(tr: pd.DataFrame, te: pd.DataFrame) -> np.ndarray:
     tbl = t.groupby(["mo", "hr"])["is_curtailed"].mean()
     idx = pd.MultiIndex.from_arrays([pd.DatetimeIndex(te.dt).month, pd.DatetimeIndex(te.dt).hour])
     return idx.map(tbl).to_numpy(dtype=float, na_value=float(tr["is_curtailed"].mean()))
+
+
+def _coverage_ci(w: np.ndarray, score: np.ndarray, days: np.ndarray, frac: float,
+                 n_boot: int = N_BOOT, alpha: float = 0.05, seed: int = 0) -> tuple[float, float]:
+    """커버율의 일블록 부트스트랩 신뢰구간.
+
+    출력제어는 날짜 단위로 뭉치므로(2023년 563시간이 117일에 분포) 시간 단위 리샘플은
+    유효 표본수를 부풀려 구간을 1.6~2.1배 좁게 만든다. 커버율은 분자·분모가 함께 움직이는
+    비율 통계라 리샘플마다 다시 계산한다.
+    """
+    uniq = np.unique(days)
+    groups = {d: np.flatnonzero(days == d) for d in uniq}
+    rng = np.random.default_rng(seed)
+    draws = []
+    for _ in range(n_boot):
+        pick = rng.choice(uniq, size=len(uniq), replace=True)
+        idx = np.concatenate([groups[d] for d in pick])
+        ww, ss = w[idx], score[idx]
+        tot = ww.sum()
+        if tot <= 0:
+            continue
+        k = max(1, int(round(len(idx) * frac)))
+        top = np.argpartition(-ss, k - 1)[:k]
+        draws.append(ww[top].sum() / tot)
+    v = np.asarray(draws)
+    lo, hi = np.percentile(v, [alpha / 2 * 100, (1 - alpha / 2) * 100])
+    return round(float(lo) * 100, 1), round(float(hi) * 100, 1)
 
 
 def evaluate(energy_type: str, use_demand: bool = True,
@@ -62,13 +90,16 @@ def evaluate(energy_type: str, use_demand: bool = True,
     unit = "MWh" if has_mwh else "제어시간"
     total = te["w"].sum()
 
+    days = pd.DatetimeIndex(te.dt).normalize().to_numpy()
     rows = []
     for b in BUDGETS:
         k = int(round(len(te) * b))
         model = te.nlargest(k, "p")["w"].sum()
         clim = te.nlargest(k, "clim")["w"].sum()
         oracle = te.nlargest(k, "w")["w"].sum()
+        lo, hi = _coverage_ci(te["w"].to_numpy(), te["p"].to_numpy(), days, b)
         rows.append({
+            "model_lo": lo, "model_hi": hi,
             "energy_type": energy_type, "unit": unit, "n_hours": len(te),
             "total": round(total, 1), "budget_pct": b * 100, "budget_hours": k,
             "model_pct": round(model / total * 100, 1),
@@ -86,10 +117,11 @@ def main() -> pd.DataFrame:
         u = g["unit"].iloc[0]
         print(f"\n[{'풍력' if et == 'wind' else '태양광'}] 테스트 {TEST_START}~{TEST_END} "
               f"· {g['n_hours'].iloc[0]:,}시간 · 총 {g['total'].iloc[0]:,.0f} {u}")
-        print(f"  {'주의 예산':>14} {'모델':>8} {'기후값':>8} {'완전예지':>8} {'모델−기후값':>11} {'달성률':>8}")
+        print(f"  {'주의 예산':>14} {'모델':>8} {'95% 구간':>16} {'기후값':>8} {'완전예지':>8} {'모델−기후값':>11}")
         for _, r in g.iterrows():
-            print(f"  {r.budget_pct:4.0f}% ({r.budget_hours:>4}h) {r.model_pct:7.1f}% {r.climatology_pct:7.1f}%"
-                  f" {r.oracle_pct:7.1f}% {r.model_minus_clim_pp:+10.1f}%p {r.model_over_oracle_pct:7.1f}%")
+            print(f"  {r.budget_pct:4.0f}% ({r.budget_hours:>4}h) {r.model_pct:7.1f}%"
+                  f"  [{r.model_lo:5.1f}, {r.model_hi:5.1f}] {r.climatology_pct:7.1f}%"
+                  f" {r.oracle_pct:7.1f}% {r.model_minus_clim_pp:+10.1f}%p")
     path = os.path.join(MODELS_DIR, "decision_value.csv")
     out.to_csv(path, index=False)
     print(f"\n저장: {path}")
