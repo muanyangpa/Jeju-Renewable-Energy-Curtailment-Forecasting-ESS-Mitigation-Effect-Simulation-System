@@ -1518,6 +1518,36 @@ weather = fetch(date(2026, 9, 28), radiation_source=src)
 오히려 나빠진다. 그래서 값은 수집해 두되(`KimHour.wind80`) 모델에는 넣지 않았다. 해소 조건은
 하나다 — **앞으로 KIM 예보와 실발전량을 나란히 쌓아 80m 학습셋을 만드는 것.**
 
+### 제출 문서 백업 — git이 이력을 맡는다 (2026-09-30)
+
+`docs/submission/` · `scripts/sync_submission.sh`
+
+작품소개서는 Word로 편집하므로 `~/Downloads`에 있고 git이 추적하지 못했다. 편집 중 백업은
+`/tmp`에 쌓았는데 **재부팅 시 지워진다.** 마감이 걸린 문서를 휘발성 위치에만 두는 것은 위험하다.
+
+**타임스탬프 사본을 저장소에 쌓지 않는다.** git이 이미 이력을 관리하므로 정본 하나만 두고,
+동기화 후 커밋하면 그 커밋이 곧 복원 지점이 된다.
+
+```
+bash scripts/sync_submission.sh status   # 양쪽 비교
+bash scripts/sync_submission.sh pull     # ~/Downloads -> 저장소 (편집 후)
+bash scripts/sync_submission.sh push     # 저장소 -> ~/Downloads (되돌릴 때만)
+git add docs/submission && git commit -m "docs: 제출 문서 동기화"
+```
+
+**안전장치 두 가지.** `pull`은 저장소 사본이 더 최신이면 경고한다 — 저장소 사본을 직접
+편집했을 가능성이 있고 덮어쓰면 그 편집이 사라진다. `push`는 `~/Downloads`가 더 최신이면
+거부한다(`--force`로만 강제). 두 경우 모두 **조용히 덮어쓰는 것이 가장 위험한 실패**다.
+
+특정 시점으로 되돌리려면 커밋에서 꺼낸다.
+
+```
+git log --oneline -- docs/submission
+git show <커밋>:docs/submission/2026_작품소개서_제주계통잉여위험예측.docx > /tmp/복원.docx
+```
+
+---
+
 ### 인증키 — 키체인에 두고 매일 자동 수집 (2026-09-29)
 
 `app/services/credentials.py` · `scripts/setup_daily_collect.sh`
