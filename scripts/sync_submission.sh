@@ -31,6 +31,8 @@ MODE="${1:-status}"
 FORCE="${2:-}"
 
 mkdir -p "$DEST"
+# Word가 문서를 열면 ~$로 시작하는 잠금 파일을 만든다. 저장소에 들어가면 안 된다.
+rm -f "$DEST"/~\$*.docx 2>/dev/null || true
 h() { [ -f "$1" ] && shasum -a 256 "$1" | cut -c1-12 || echo "------------"; }
 mt() { [ -f "$1" ] && date -r "$1" "+%m-%d %H:%M" || echo "     없음    "; }
 
