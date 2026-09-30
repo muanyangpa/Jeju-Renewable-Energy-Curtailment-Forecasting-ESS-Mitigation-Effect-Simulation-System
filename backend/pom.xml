@@ -41,6 +41,15 @@
             <scope>runtime</scope>
         </dependency>
 
+        <!-- 로컬 연동 테스트용 인메모리 DB. 기본 프로파일에는 영향이 없고,
+             -Dspring-boot.run.profiles=localtest 로 띄울 때만 쓰인다.
+             PostgreSQL을 설치하지 않고도 Backend <-> AI 서버 연동을 확인하기 위한 것. -->
+        <dependency>
+            <groupId>com.h2database</groupId>
+            <artifactId>h2</artifactId>
+            <scope>runtime</scope>
+        </dependency>
+
         <!-- 보안 (인증/인가) -->
         <dependency>
             <groupId>org.springframework.boot</groupId>
