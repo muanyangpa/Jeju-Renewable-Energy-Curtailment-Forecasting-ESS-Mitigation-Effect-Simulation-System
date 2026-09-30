@@ -13,7 +13,12 @@
 
   .venv/bin/python scripts/kim_validation_log.py collect            # 내일 거래일
   .venv/bin/python scripts/kim_validation_log.py collect 2026-09-29
+  .venv/bin/python scripts/kim_validation_log.py collect --force    # 이미 받았어도 다시
   .venv/bin/python scripts/kim_validation_log.py report
+
+이미 24시간을 받아둔 (거래일, 분석시각)이면 **API를 호출하지 않고 끝낸다.** 스케줄을 하루 네 번
+걸어두기 때문이다 — 맥이 10시에 잠들어 있으면 launchd가 그 실행을 건너뛰므로(실측: runs=0)
+뒤의 시각이 받아내야 하고, 이미 받았으면 조용히 끝나야 한다.
 
 [읽는 법]
 ASOS 실측을 정답으로 두고 두 경로의 MAE를 비교한다. KIM이 더 낮으면 교체가 옳았다는
@@ -40,7 +45,24 @@ COLS = ["target_date", "hour", "tmfc", "kim_mj", "kim_inst_mj", "est_mj",
         "wind80", "temp_c", "collected_at"]
 
 
-def collect(target: dt.date) -> None:
+def already_collected(target: dt.date, tmfc: str) -> bool:
+    """이미 24시간을 받아둔 (거래일, 분석시각)인지. 중복 API 호출을 막는다.
+
+    스케줄을 하루 여러 번(10/12/14/16시) 걸어두기 때문에 필요하다 — 맥이 10시에 잠들어 있으면
+    launchd가 그 실행을 건너뛰므로 뒤의 시각이 받아내야 하고, 이미 받았으면 조용히 끝내야 한다.
+    """
+    if not os.path.exists(LOG):
+        return False
+    d = pd.read_csv(LOG, dtype={"tmfc": str, "target_date": str})
+    m = (d["target_date"] == target.isoformat()) & (d["tmfc"] == tmfc)
+    return int(m.sum()) >= 24
+
+
+def collect(target: dt.date, force: bool = False) -> None:
+    tmfc0 = K.default_tmfc(target)
+    if not force and already_collected(target, tmfc0):
+        print(f"이미 수집 완료 ({target} / tmfc={tmfc0}) — API를 호출하지 않고 끝냅니다.")
+        return
     rows = K.fetch_day(target, lat=LAT, lon=LON)
     if len(rows) != 24:
         print(f"❌ 24시간 중 {len(rows)}개만 받았습니다 — 기록하지 않습니다.")
@@ -131,9 +153,10 @@ def report() -> None:
 if __name__ == "__main__":
     mode = sys.argv[1] if len(sys.argv) > 1 else "collect"
     if mode == "collect":
-        t = (dt.date.fromisoformat(sys.argv[2]) if len(sys.argv) > 2
+        args = [a for a in sys.argv[2:] if not a.startswith("-")]
+        t = (dt.date.fromisoformat(args[0]) if args
              else dt.date.today() + dt.timedelta(days=1))
-        collect(t)
+        collect(t, force="--force" in sys.argv)
     elif mode == "report":
         report()
     else:

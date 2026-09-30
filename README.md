@@ -1499,9 +1499,15 @@ weather = fetch(date(2026, 9, 28), radiation_source=src)
 사라지므로 사후 재현이 불가능하다.
 
 ```
-.venv/bin/python scripts/kim_validation_log.py collect     # 매일 한 번. 놓친 날은 되돌릴 수 없다
+.venv/bin/python scripts/kim_validation_log.py collect     # 이미 받은 날은 API 호출 없이 끝난다
 .venv/bin/python scripts/kim_validation_log.py report      # 실측이 올라온 뒤 두 경로 비교
 ```
+
+**하루 네 번(10·12·14·16시) 스케줄한다.** 처음엔 10시 한 번만 걸었는데 첫날 실행되지 않았다
+(`launchd runs=0`). `StartCalendarInterval`은 **그 시각에 맥이 깨어 있어야 발동**하고 잠들어
+있으면 그 실행을 건너뛴다. 하루를 놓치면 API에 과거 예보 보관이 없어 영구히 비므로 네 번으로
+늘렸다. 이미 24시간을 받아둔 (거래일, 분석시각)이면 스크립트가 API를 호출하지 않고 끝내므로
+네 번 걸어도 낭비가 없다.
 
 측정된 값이 생기면 `evaluate_forecast_degradation.py --radiation-csv`에 넣어 재측정한다.
 

@@ -9,10 +9,18 @@
 # API가 과거 예보를 보관하지 않는다 — 응답이 오는 가장 오래된 분석시각이 하루 전이다.
 # 놓친 날은 되돌릴 수 없고, 그만큼 검증 표본이 영구히 비게 된다.
 #
-# [왜 10시인가]
+# [왜 하루 네 번인가 — 10시 한 번으로는 놓친다]
+# 처음에는 10시 한 번만 걸었는데 첫날 실행되지 않았다(launchd runs=0). StartCalendarInterval은
+# 그 시각에 맥이 깨어 있어야 발동하고, 잠들어 있으면 그 실행을 건너뛴다. 하루를 놓치면
+# API에 과거 예보 보관이 없어 영구히 비게 되므로 10/12/14/16시 네 번으로 늘렸다.
+#
+# 이미 24시간을 받아둔 (거래일, 분석시각)이면 스크립트가 API를 호출하지 않고 끝내므로
+# 네 번 걸어도 낭비가 없다.
+#
+# [왜 10시부터인가]
 # 거래일 D의 자료를 받으려면 D-1 09:00 KST(단기예보 08시 발표 + KIM 생산 완료) 이후여야 하고,
-# KIM 보관이 만료되는 D 07:00 KST 전이어야 한다. 10시는 그 창의 앞쪽이라 하루를 통째로
-# 놓칠 여유가 크고, 하루전시장 입찰마감(D-1 11시)과도 같은 타이밍이다.
+# KIM 보관이 만료되는 D 07:00 KST 전이어야 한다. 10시는 그 창의 앞쪽이고 하루전시장
+# 입찰마감(D-1 11시)과도 같은 타이밍이다.
 #
 # 사용:  bash scripts/setup_daily_collect.sh          등록
 #        bash scripts/setup_daily_collect.sh remove   해제
@@ -56,9 +64,13 @@ cat > "$PLIST" <<EOF
     <string>collect</string>
   </array>
   <key>WorkingDirectory</key><string>$REPO</string>
-  <key>StartCalendarInterval</key><dict>
-    <key>Hour</key><integer>10</integer><key>Minute</key><integer>0</integer>
-  </dict>
+  <key>StartCalendarInterval</key>
+  <array>
+    <dict><key>Hour</key><integer>10</integer><key>Minute</key><integer>0</integer></dict>
+    <dict><key>Hour</key><integer>12</integer><key>Minute</key><integer>0</integer></dict>
+    <dict><key>Hour</key><integer>14</integer><key>Minute</key><integer>0</integer></dict>
+    <dict><key>Hour</key><integer>16</integer><key>Minute</key><integer>0</integer></dict>
+  </array>
   <key>StandardOutPath</key><string>$LOG</string>
   <key>StandardErrorPath</key><string>$LOG</string>
 </dict></plist>
@@ -66,11 +78,12 @@ EOF
 
 launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
 launchctl bootstrap "gui/$(id -u)" "$PLIST"
-echo "✅ 등록 완료 — 매일 10:00에 실행"
+echo "✅ 등록 완료 — 매일 10·12·14·16시 실행 (이미 받은 날은 API 호출 없이 끝남)"
 echo "   로그:   $LOG"
 echo "   상태:   launchctl print gui/$(id -u)/$LABEL | head -20"
 echo "   즉시실행: launchctl kickstart -k gui/$(id -u)/$LABEL"
 echo "   해제:   bash scripts/setup_daily_collect.sh remove"
 echo
-echo "⚠ 맥이 꺼져 있거나 잠들어 있으면 그 날은 건너뜁니다. API 보관이 하루뿐이라"
-echo "  놓친 날은 되돌릴 수 없으니, 며칠에 한 번 로그를 확인하세요."
+echo "⚠ 네 시각 모두 맥이 꺼져 있거나 잠들어 있으면 그 날은 건너뜁니다."
+echo "  API 보관이 하루뿐이라 놓친 날은 되돌릴 수 없습니다. 며칠에 한 번 로그를 확인하고,"
+echo "  놓친 날이 보이면 그날 07시 전까지는 collect로 복구할 수 있습니다."
