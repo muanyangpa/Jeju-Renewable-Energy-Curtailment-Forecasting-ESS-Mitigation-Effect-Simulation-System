@@ -129,6 +129,65 @@ class TestResponseShape:
         assert "crossp" in with_solar and "crossp" not in without
 
 
+class TestValueRange:
+    """물리적으로 불가능한 값은 200이 아니라 422여야 한다 (v1.2).
+
+    범위를 넣기 전에는 solar_rad=-1, wind_speed=500이 200으로 통과해 그럴듯한 숫자를 돌려줬다.
+    드리프트 경고가 note에 실리긴 했지만 HTTP는 200이라, Backend가 note를 파싱하지 않으면
+    쓰레기 예측이 DB와 화면까지 간다.
+    """
+
+    @pytest.mark.parametrize("field,value", [
+        ("solar_rad", -1.0), ("solar_rad", 999.0),
+        ("temp", 999.0), ("temp", -273.0),
+        ("cloud", 99.0), ("cloud", -1.0),
+        ("wind_speed", -5.0), ("wind_speed", 500.0),
+    ])
+    def test_범위_밖_기상값은_422(self, field, value):
+        w = [{**x, field: value} for x in FULL]
+        r = post(weather=w)
+        assert r.status_code == 422, f"{field}={value}가 통과했다: {r.json()}"
+        assert field in r.json()["message"], r.json()
+
+    @pytest.mark.parametrize("field,value", [
+        ("solar_rad", 0.0), ("solar_rad", 3.9),      # 제주 실측 최대 3.9
+        ("temp", -3.1), ("temp", 37.0),              # 제주 실측 범위
+        ("cloud", 0.0), ("cloud", 10.0),
+        ("wind_speed", 0.0), ("wind_speed", 13.7),
+    ])
+    def test_실측_범위_안의_값은_통과한다(self, field, value):
+        """상한을 실측보다 넉넉히 둔 이유 — 예보가 실측을 조금 넘는 것은 정상이다."""
+        r = post(weather=[{**x, field: value} for x in FULL])
+        assert r.status_code == 200, f"{field}={value}가 거부됐다: {r.json()}"
+
+    def test_수요가_0이하면_422(self):
+        r = post(demand_forecast_mw=[-100.0] + [620.0] * 23)
+        assert r.status_code == 422
+        assert r.json()["error_code"] == "OUT_OF_RANGE"
+        assert "1시=-100" in r.json()["message"], r.json()
+
+
+class TestEssValueRange:
+    def _ess(self, **kw):
+        return client.post("/ess/simulate", json={"hourly_curtailment_mwh": [10.0] * 24, **kw})
+
+    def test_정상(self):
+        assert self._ess().status_code == 200
+
+    @pytest.mark.parametrize("kw", [
+        {"hourly_curtailment_mwh": []},
+        {"rated_power_mw": 0},
+        {"rated_power_mw": -10},
+    ])
+    def test_빈배열과_0이하_정격출력은_422(self, kw):
+        """정격출력 -10은 예전에 흡수율 −1.0을 돌려줬다 — 의미 없는 값이다."""
+        assert self._ess(**kw).status_code == 422
+
+    def test_음수_제어량은_422(self):
+        r = self._ess(hourly_curtailment_mwh=[-5.0] * 24)
+        assert r.status_code == 422 and r.json()["error_code"] == "OUT_OF_RANGE"
+
+
 def test_health는_200이다():
     r = client.get("/health")
     assert r.status_code == 200 and r.json()["status"] == "ok"

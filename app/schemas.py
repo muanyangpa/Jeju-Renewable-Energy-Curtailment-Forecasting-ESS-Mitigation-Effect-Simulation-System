@@ -43,12 +43,34 @@ class WeatherHour(BaseModel):
     한 시간이라도 null이면 422 MISSING_REQUIRED_FIELD이고, 메시지에 누락 위치가 `13시.solar_rad`
     형태로 최대 5건까지 들어간다. 조용히 0으로 대체하지 않는다 — 풍속 null을 0으로 바꾸면
     '제어 없음'으로 오예측한다(이 동작을 실제로 겪어 고쳤다).
+
+    [값 범위 — 2026-09-30 추가]
+    범위를 넣기 전에는 `solar_rad: -1`(음수 일사량), `wind_speed: 500`이 **200으로 통과해
+    그럴듯한 숫자를 돌려줬다.** 드리프트 경고가 note에 실리기는 했지만 HTTP 상태는 200이라,
+    Backend가 note를 파싱하지 않으면 쓰레기 예측이 DB와 화면까지 간다.
+
+    상한은 제주 ASOS 184 실측(2021~2023)보다 넉넉히 두고 물리 한계만 지킨다 —
+    예보값이 실측 범위를 조금 넘는 것은 정상이므로 그것까지 막으면 안 된다.
+
+      필드         실측 범위        허용 범위     근거
+      solar_rad   0.0 ~ 3.9       0 ~ 6        음수 불가
+      temp        −3.1 ~ 37.0     −30 ~ 50
+      cloud       0.0 ~ 10.0      0 ~ 10       기상청 전운량 정의
+      wind_speed  0.0 ~ 13.7      0 ~ 60       음수 불가, 태풍 최대풍속 여유
     """
     hour: int = Field(..., ge=1, le=24, description="1~24시 (24시 = 자정)")
-    solar_rad: Optional[float] = Field(None, description="일사량(MJ/m2) — solar일 때 필수, wind일 때 선택")
-    temp: Optional[float] = Field(None, description="기온(°C) — solar일 때 필수, wind일 때 선택")
-    cloud: Optional[float] = Field(None, description="전운량(0~10) — solar일 때 필수, wind일 때 선택")
-    wind_speed: Optional[float] = Field(None, description="풍속(m/s) — wind일 때 필수, solar일 때 선택")
+    solar_rad: Optional[float] = Field(
+        None, ge=0.0, le=6.0,
+        description="일사량(MJ/m2) — solar일 때 필수, wind일 때 선택. 0 이상 (음수는 물리적으로 불가)")
+    temp: Optional[float] = Field(
+        None, ge=-30.0, le=50.0,
+        description="기온(°C) — solar일 때 필수, wind일 때 선택")
+    cloud: Optional[float] = Field(
+        None, ge=0.0, le=10.0,
+        description="전운량 — solar일 때 필수, wind일 때 선택. 기상청 정의상 0~10")
+    wind_speed: Optional[float] = Field(
+        None, ge=0.0, le=60.0,
+        description="풍속(m/s) — wind일 때 필수, solar일 때 선택. 0 이상 (음수는 물리적으로 불가)")
 
 
 class PredictRequest(BaseModel):
@@ -64,7 +86,7 @@ class PredictRequest(BaseModel):
     target_date: date
     weather: list[WeatherHour] = Field(..., description="정확히 24개, 1~24시 각 1회")
     demand_forecast_mw: Optional[list[float]] = Field(
-        None, description="24개(선택). 있으면 침투율(발전량/수요) 포함 모델을 사용한다 — 태양광·풍력 모두 정확도가 올라간다(태양광 PR-AUC 0.639->0.711). 풍력은 수요 자체도 정식 피처다(05장). 생략하면 미포함 모델로 자동 전환되고 풍력의 expected_curtailment_mwh는 null이 된다"
+        None, description="24개(선택). 각 값은 0 초과(제주 실측 378~1,104MW). 있으면 침투율(발전량/수요) 포함 모델을 사용한다 — 태양광·풍력 모두 정확도가 올라간다(태양광 PR-AUC 0.639->0.711). 풍력은 수요 자체도 정식 피처다(05장). 생략하면 미포함 모델로 자동 전환되고 풍력의 expected_curtailment_mwh는 null이 된다"
     )
 
     @field_validator("weather")
@@ -87,8 +109,14 @@ class PredictRequest(BaseModel):
 
     @model_validator(mode="after")
     def _check_demand_length(self) -> "PredictRequest":
-        if self.demand_forecast_mw is not None and len(self.demand_forecast_mw) != 24:
-            raise ValueError("INVALID_HOUR_SET:demand_forecast_mw는 24개여야 합니다")
+        if self.demand_forecast_mw is not None:
+            if len(self.demand_forecast_mw) != 24:
+                raise ValueError("INVALID_HOUR_SET:demand_forecast_mw는 24개여야 합니다")
+            bad = [f"{i+1}시={v:g}" for i, v in enumerate(self.demand_forecast_mw) if v <= 0]
+            if bad:
+                raise ValueError(
+                    "OUT_OF_RANGE:demand_forecast_mw는 0보다 커야 합니다 "
+                    f"(위반: {', '.join(bad[:5])}{f' 외 {len(bad)-5}건' if len(bad) > 5 else ''})")
         return self
 
     @model_validator(mode="after")
@@ -159,8 +187,10 @@ class PredictResponse(BaseModel):
 
 
 class EssSimulateRequest(BaseModel):
-    hourly_curtailment_mwh: list[float] = Field(..., description="시간별 출력제어량(MWh), 24개 또는 임의 길이")
-    rated_power_mw: float = Field(65.0, description="ESS 정격출력(MW) — 04장 03번 슬라이더 1축. 기본값은 제주 장주기 BESS 중앙계약시장 물량")
+    hourly_curtailment_mwh: list[float] = Field(
+        ..., min_length=1,
+        description="시간별 출력제어량(MWh), 24개 또는 임의 길이. 빈 배열 불가, 각 값은 0 이상")
+    rated_power_mw: float = Field(65.0, gt=0.0, description="ESS 정격출력(MW), 0 초과. — 04장 03번 슬라이더 1축. 기본값은 제주 장주기 BESS 중앙계약시장 물량")
     method: Literal["storage_constrained", "hourly_capped", "naive_upper_bound"] = "storage_constrained"
     # --- method="storage_constrained" 전용 (저장용량 제약 반영) ---
     energy_capacity_mwh: float | None = Field(
@@ -175,6 +205,10 @@ class EssSimulateRequest(BaseModel):
 
     @model_validator(mode="after")
     def _check_storage(self):
+        bad = [f"{i}번째={v:g}" for i, v in enumerate(self.hourly_curtailment_mwh) if v < 0]
+        if bad:
+            raise ValueError("OUT_OF_RANGE:hourly_curtailment_mwh에 음수가 있습니다 "
+                             f"(위반: {', '.join(bad[:5])})")
         if self.soc_min >= self.soc_max:
             raise ValueError("INVALID_SOC_RANGE:soc_min이 soc_max보다 작아야 합니다")
         if self.energy_capacity_mwh is not None and self.energy_capacity_mwh <= 0:
