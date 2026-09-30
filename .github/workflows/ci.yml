@@ -22,6 +22,15 @@ jobs:
       - name: pytest (아티팩트 필요 테스트는 skip)
         run: python -m pytest tests/ -v --tb=short -rs
 
+      # 아티팩트가 필요한 테스트에 @needs_artifacts를 빠뜨리면 로컬은 통과하고 CI만 깨진다.
+      # 실제로 한 번 겪었다(#16, TestValueRange가 200을 기대하면서 가드가 없었다).
+      # skip이 하나도 없으면 가드가 빠진 것이거나 CI가 아무것도 건너뛰지 않은 것이므로 실패시킨다.
+      - name: 아티팩트 가드 확인 (skip이 있어야 정상)
+        run: |
+          n=$(python -m pytest tests/ -q --tb=no -rs 2>&1 | grep -oE '[0-9]+ skipped' | grep -oE '[0-9]+' || echo 0)
+          echo "skipped: $n"
+          [ "$n" -gt 0 ] || { echo "❌ skip이 0건 — @needs_artifacts 누락이 의심됩니다"; exit 1; }
+
   backend:
     runs-on: ubuntu-latest
     steps:

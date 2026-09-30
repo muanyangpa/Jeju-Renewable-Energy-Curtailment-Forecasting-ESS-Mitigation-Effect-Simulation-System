@@ -135,6 +135,9 @@ class TestValueRange:
     범위를 넣기 전에는 solar_rad=-1, wind_speed=500이 200으로 통과해 그럴듯한 숫자를 돌려줬다.
     드리프트 경고가 note에 실리긴 했지만 HTTP는 200이라, Backend가 note를 파싱하지 않으면
     쓰레기 예측이 DB와 화면까지 간다.
+
+    **거부(422)는 모델 없이도 검증된다** — pydantic이 모델 로드 전에 막기 때문이다.
+    통과(200)를 확인하는 테스트만 아티팩트가 필요해 아래 클래스로 분리했다.
     """
 
     @pytest.mark.parametrize("field,value", [
@@ -149,22 +152,30 @@ class TestValueRange:
         assert r.status_code == 422, f"{field}={value}가 통과했다: {r.json()}"
         assert field in r.json()["message"], r.json()
 
-    @pytest.mark.parametrize("field,value", [
-        ("solar_rad", 0.0), ("solar_rad", 3.9),      # 제주 실측 최대 3.9
-        ("temp", -3.1), ("temp", 37.0),              # 제주 실측 범위
-        ("cloud", 0.0), ("cloud", 10.0),
-        ("wind_speed", 0.0), ("wind_speed", 13.7),
-    ])
-    def test_실측_범위_안의_값은_통과한다(self, field, value):
-        """상한을 실측보다 넉넉히 둔 이유 — 예보가 실측을 조금 넘는 것은 정상이다."""
-        r = post(weather=[{**x, field: value} for x in FULL])
-        assert r.status_code == 200, f"{field}={value}가 거부됐다: {r.json()}"
-
     def test_수요가_0이하면_422(self):
         r = post(demand_forecast_mw=[-100.0] + [620.0] * 23)
         assert r.status_code == 422
         assert r.json()["error_code"] == "OUT_OF_RANGE"
         assert "1시=-100" in r.json()["message"], r.json()
+
+
+@needs_artifacts
+class TestValueRangeAccepts:
+    """실측 범위 안의 값은 200이어야 한다 — 상한을 잘못 조여 정상 예보를 막는 일을 잡는다.
+
+    200을 확인하려면 예측이 끝까지 돌아야 하므로 학습 아티팩트가 필요하다.
+    CI에는 models/가 없어(gitignore) skip된다 — 거부 쪽은 TestValueRange가 모델 없이 검증한다.
+    """
+
+    @pytest.mark.parametrize("field,value", [
+        ("solar_rad", 0.0), ("solar_rad", 3.9),      # 제주 ASOS 184 실측 최대 3.9
+        ("temp", -3.1), ("temp", 37.0),              # 실측 −3.1~37.0
+        ("cloud", 0.0), ("cloud", 10.0),
+        ("wind_speed", 0.0), ("wind_speed", 13.7),   # 실측 최대 13.7
+    ])
+    def test_실측_범위_안의_값은_통과한다(self, field, value):
+        r = post(weather=[{**x, field: value} for x in FULL])
+        assert r.status_code == 200, f"{field}={value}가 거부됐다: {r.json()}"
 
 
 class TestEssValueRange:
