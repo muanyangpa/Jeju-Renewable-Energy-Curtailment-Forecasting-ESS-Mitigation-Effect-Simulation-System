@@ -36,6 +36,8 @@ import pandas as pd
 
 from app.data_prep import add_time_features
 from app.model_io import load_artifact
+from app.services import kim_forecast
+from app.services.credentials import resolve_secret, setup_hint
 from app.solar_radiation import add_solar_geometry, cloud_from_sky, latlon_to_grid
 
 # 같은 서비스(VilageFcstInfoService_2.0 / 동네예보 > 단기예보조회)를 두 포털이 각자 제공한다.
@@ -85,8 +87,14 @@ def _rows_to_frame(items: list[dict], target: date) -> pd.DataFrame:
     return wide.reset_index()
 
 
-def _to_weather(wide: pd.DataFrame, target: date, station: str = "184") -> list[dict]:
-    """예보 프레임 -> /predict의 weather 24개. 일사량은 추정해서 채운다."""
+def _to_weather(wide: pd.DataFrame, target: date, station: str = "184",
+                rad_override: dict[int, float] | None = None) -> list[dict]:
+    """예보 프레임 -> /predict의 weather 24개.
+
+    rad_override가 오면(KIM 국지모델 일사량 예보) 그 값을 쓰고, 없으면 radiation_estimator로
+    추정한다. 24시간이 다 채워지지 않은 override는 호출부에서 이미 None으로 바뀌어 온다 —
+    일부는 예보값, 일부는 추정값인 상태를 만들지 않기 위한 것이다.
+    """
     base = datetime.combine(target, datetime.min.time())
     # hour 0은 자정을 뜻하고 이 저장소 규약에서는 전날 24시다 — 거래일 24시로 옮긴다.
     wide = wide.copy()
@@ -101,16 +109,20 @@ def _to_weather(wide: pd.DataFrame, target: date, station: str = "184") -> list[
     df["cloud"] = cloud_from_sky(df["sky"])
     df = add_solar_geometry(add_time_features(df), station)
 
-    art = load_artifact("radiation_estimator")
-    night = float(art["meta"].get("night_threshold_mj", 0.02))
-    rad = np.zeros(len(df))
-    mask = (df["clear_sky_mj"] > night).to_numpy()
-    if mask.any():
-        pred = art["model"].predict(df.loc[mask, art["features"]])
-        if (art["meta"].get("target") or "").startswith("clear_sky_index"):
-            pred = np.clip(pred, 0, 1.2) * df.loc[mask, "clear_sky_mj"].to_numpy()
-        rad[mask] = np.clip(pred, 0, None)
-    df["solar_rad"] = rad
+    if rad_override is not None:
+        hours = [int(pd.Timestamp(t).hour) or 24 for t in df["dt"]]
+        df["solar_rad"] = np.clip([rad_override[h] for h in hours], 0, None)
+    else:
+        art = load_artifact("radiation_estimator")
+        night = float(art["meta"].get("night_threshold_mj", 0.02))
+        rad = np.zeros(len(df))
+        mask = (df["clear_sky_mj"] > night).to_numpy()
+        if mask.any():
+            pred = art["model"].predict(df.loc[mask, art["features"]])
+            if (art["meta"].get("target") or "").startswith("clear_sky_index"):
+                pred = np.clip(pred, 0, 1.2) * df.loc[mask, "clear_sky_mj"].to_numpy()
+            rad[mask] = np.clip(pred, 0, None)
+        df["solar_rad"] = rad
 
     out = []
     # r.dt는 pandas의 .dt 접근자와 이름이 겹치므로 반드시 r["dt"]로 꺼낸다.
@@ -146,26 +158,32 @@ def _ssl_context():
 
 
 def resolve_key(portal: str | None = None, key: str | None = None) -> tuple[str, str]:
-    """(포털 이름, 인증키). 환경변수에서 찾고, 없으면 무엇을 해야 하는지 알려주며 실패한다."""
+    """(포털 이름, 인증키). 환경변수 -> macOS 키체인 순으로 찾는다.
+
+    키체인을 함께 보는 이유는 매일 도는 자동 수집(scripts/kim_validation_log.py) 때문이다 —
+    cron/launchd는 로그인 셸을 거치지 않아 ~/.zshrc의 export가 보이지 않는다.
+    """
     if portal and portal not in PORTALS:
         raise ValueError(f"portal은 {list(PORTALS)} 중 하나여야 합니다 (받은 값: {portal!r})")
     if key:
         return portal or "apihub", key
     order = [portal] if portal else list(PORTALS)
     for name in order:
-        env = PORTALS[name]["env"]
-        v = os.environ.get(env)
+        v = resolve_secret(PORTALS[name]["env"])
         if v:
-            return name, v.strip()
-    lines = [f"  export {PORTALS[n]['env']}=발급받은키    # {PORTALS[n]['label']}" for n in order]
-    raise RuntimeError("기상청 인증키를 찾지 못했습니다. 아래 중 하나를 환경변수로 넣으세요.\n"
-                       + "\n".join(lines))
+            return name, v
+    labels = "\n".join(f"  {PORTALS[n]['env']:18} {PORTALS[n]['label']}" for n in order)
+    raise RuntimeError(
+        "기상청 인증키를 찾지 못했습니다 (환경변수·키체인 모두 없음).\n"
+        f"쓸 수 있는 이름:\n{labels}\n\n" + setup_hint(PORTALS[order[0]]["env"]))
 
 
 def fetch(target: date, lat: float = 33.5141, lon: float = 126.5297,
           base_time: str = DEFAULT_BASE_TIME, key: str | None = None,
           portal: str | None = None, sample_path: str | None = None,
-          timeout: float = 10.0) -> list[dict]:
+          timeout: float = 10.0, use_kim: bool | None = None,
+          radiation_source: list | None = None,
+          kim_sample_path: str | None = None) -> list[dict]:
     """거래일 target의 예보를 받아 /predict의 weather 24개로 만든다.
 
     인증키는 환경변수에서 읽는다 — KMA_AUTH_KEY(API허브) 또는 KMA_SERVICE_KEY(공공데이터포털).
@@ -230,7 +248,20 @@ def fetch(target: date, lat: float = 33.5141, lon: float = 126.5297,
     if header.get("resultCode") not in (None, "00"):
         raise RuntimeError(f"기상청 API 오류 {header.get('resultCode')}: {header.get('resultMsg')}")
     items = ((body.get("items") or {}).get("item")) or []
-    return _to_weather(_rows_to_frame(items, target), target)
+
+    # 일사량은 단기예보에 없다. KIM 국지모델(1.5km) 예보값을 먼저 시도하고, 못 받으면 추정한다.
+    # 실패 사유를 삼키지 않도록 어느 쪽을 썼는지 radiation_source에 남긴다.
+    # sample_path(오프라인 재생)에서는 KIM 샘플을 따로 주지 않는 한 네트워크를 타지 않는다.
+    if use_kim is None:
+        use_kim = sample_path is None or kim_sample_path is not None
+    override, note = None, []
+    if use_kim:
+        override = kim_forecast.radiation_override(
+            target, note=note, lat=lat, lon=lon, key=key, sample_path=kim_sample_path)
+    if radiation_source is not None:
+        radiation_source.append("kim_l010" if override is not None
+                                else "estimator" + (f" (KIM 폴백: {note[0]})" if note else ""))
+    return _to_weather(_rows_to_frame(items, target), target, rad_override=override)
 
 
 def self_check(target: date | None = None, **kw) -> None:
@@ -249,8 +280,15 @@ def self_check(target: date | None = None, **kw) -> None:
     print(f"\n사용 포털: {PORTALS[name]['label']}")
     print(f"거래일 {target} · 좌표 ({lat}, {lon}) -> 격자 {latlon_to_grid(lat, lon)} · "
           f"발표시각 {kw.get('base_time', DEFAULT_BASE_TIME)}")
-    weather = fetch(target, **kw)
+    src: list[str] = []
+    weather = fetch(target, radiation_source=src, **kw)
     print(f"\n✅ 예보 {len(weather)}시간 수신")
+    if src:
+        ok = src[0] == "kim_l010"
+        print(f"  일사량 출처: {'KIM 국지예보모델 1.5km (예보값)' if ok else src[0]}")
+        if not ok:
+            print("     KIM을 못 받아 추정값으로 돌아갔습니다. 정보 손실 +2.99%p가 그대로 남습니다.\n"
+                  "     scripts/verify_kim_radiation.py로 분석시각 가용성을 확인해보세요.")
     print(f"  {'시':>3} {'기온':>6} {'풍속':>6} {'운량':>6} {'일사량':>8}")
     for w in weather:
         if w["hour"] in (1, 6, 9, 12, 13, 15, 18, 21, 24):
@@ -271,8 +309,13 @@ def build_predict_request(energy_type: str, target: date, region: str = "제주"
     합계로 결정되므로 계통 전체 침투율 모델로 자동 전환되게 하려는 것이다
     (README '계통 전체 침투율').
     """
-    body = {"energy_type": energy_type, "region": region,
-            "target_date": target.isoformat(), "weather": fetch(target, **kw)}
+    src: list[str] = []
+    body = {"energy_type": energy_type, "region": region, "target_date": target.isoformat(),
+            "weather": fetch(target, radiation_source=src, **kw)}
+    # 요청 본문에는 넣지 않는다(스키마에 없는 필드는 거부된다). 호출부가 보려면 반환값 대신
+    # fetch(radiation_source=...)를 직접 쓰면 된다. 여기서는 표준출력에만 남긴다.
+    if src:
+        print(f"  일사량 출처: {src[0]}")
     if demand_forecast_mw is not None:
         body["demand_forecast_mw"] = demand_forecast_mw
     return body

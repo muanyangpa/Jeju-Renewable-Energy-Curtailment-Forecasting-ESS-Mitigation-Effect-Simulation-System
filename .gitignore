@@ -11,3 +11,9 @@ data/
 # API 인증키 등 로컬 비밀값 (절대 커밋하지 말 것)
 .env
 .env.*
+logs/
+~$*.docx
+~$*.doc
+
+# 제출 문서 — 공개 저장소이므로 추적하지 않는다 (README "제출 문서 백업" 참고)
+docs/submission/

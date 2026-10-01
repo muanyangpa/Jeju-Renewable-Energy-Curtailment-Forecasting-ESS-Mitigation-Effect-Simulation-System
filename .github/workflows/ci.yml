@@ -2,6 +2,9 @@
 # 원본 데이터(data/)와 학습된 모델(models/)은 .gitignore 대상이라 CI에 없다 — 그것들이
 # 필요한 테스트는 tests/conftest.py가 skip으로 표시한다. '통과'가 아니라 'skipped'로
 # 보여야 CI가 아무것도 검증하지 않는데 초록불이 뜨는 일을 막을 수 있다.
+# [러너 고정 — 2026-09-30]
+# ubuntu-latest는 2026-10-19부터 Ubuntu 26을 가리킨다. 10/11 제출과 11/11 시연 사이라
+# 그 전환이 CI를 깨면 대응할 여유가 없다. 명시적으로 고정하고, 시연 후에 올린다.
 name: CI
 
 on:
@@ -11,10 +14,10 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"   # 아티팩트를 학습한 버전과 맞춘다 (requirements.txt 주석 참고)
           cache: pip
@@ -22,11 +25,20 @@ jobs:
       - name: pytest (아티팩트 필요 테스트는 skip)
         run: python -m pytest tests/ -v --tb=short -rs
 
+      # 아티팩트가 필요한 테스트에 @needs_artifacts를 빠뜨리면 로컬은 통과하고 CI만 깨진다.
+      # 실제로 한 번 겪었다(#16, TestValueRange가 200을 기대하면서 가드가 없었다).
+      # skip이 하나도 없으면 가드가 빠진 것이거나 CI가 아무것도 건너뛰지 않은 것이므로 실패시킨다.
+      - name: 아티팩트 가드 확인 (skip이 있어야 정상)
+        run: |
+          n=$(python -m pytest tests/ -q --tb=no -rs 2>&1 | grep -oE '[0-9]+ skipped' | grep -oE '[0-9]+' || echo 0)
+          echo "skipped: $n"
+          [ "$n" -gt 0 ] || { echo "❌ skip이 0건 — @needs_artifacts 누락이 의심됩니다"; exit 1; }
+
   backend:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-java@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-java@v6
         with:
           distribution: temurin
           java-version: "21"       # pom.xml의 release 버전

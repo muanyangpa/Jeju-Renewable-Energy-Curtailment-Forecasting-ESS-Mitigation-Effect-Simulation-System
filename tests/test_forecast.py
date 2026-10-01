@@ -142,3 +142,66 @@ def test_잘못된_포털_이름은_거부한다(monkeypatch):
     monkeypatch.setenv("KMA_AUTH_KEY", "a")
     with pytest.raises(ValueError, match="portal"):
         resolve_key("kma")
+
+
+# ---------------------------------------------------------------------------
+# KIM 일사량 예보로의 교체 — 예보값이 오면 추정 모델을 쓰지 않아야 한다
+# ---------------------------------------------------------------------------
+
+def _kim_sample(tmp_path, target=date(2026, 3, 15), hours=range(1, 25), direct=50.0):
+    """KIM 응답 원문 형식의 가짜 샘플. tests/test_kim_forecast.py의 형식과 같다."""
+    from app.services import kim_forecast as K
+    import datetime as _dt
+    tmfc = K.default_tmfc(target)
+    t0 = _dt.datetime.strptime(tmfc, "%Y%m%d%H")
+    hfs = sorted({K.hf_for(target, h, tmfc) for h in hours}
+                 | {K.hf_for(target, min(hours), tmfc) - 1})
+    out = []
+    for hf in hfs:
+        t = (t0 + _dt.timedelta(hours=hf)).strftime("%Y%m%d%H")
+        out.append(f"#hf={hf}")
+        for val, name in ((direct, "SWDDIR2(W m-2)"), (100.0, "SWDDIF2(W m-2)"),
+                          # 누적 시간당 1.08 MJ. 순간값 합성은 (200+100)*0.0036 = 1.08로
+                          # 같게 두지 않고 direct를 달리 줘 어느 쪽을 썼는지 구분한다.
+                          (1.08 * (hf - hfs[0]), "ACSWDNB(MJ m-2)"),
+                          (-3.0, "U80(m s-1)"), (-4.0, "V80(m s-1)"), (283.15, "T2(K)")):
+            out.append(f"{t} {tmfc} 000 000 {val} {name}")
+    p = tmp_path / "kim.txt"
+    p.write_text("\n".join(out) + "\n", encoding="utf-8")
+    return str(p)
+
+
+@needs_rad
+def test_KIM_예보값이_오면_추정을_쓰지_않는다(tmp_path):
+    """단기예보에 일사량이 없어 추정하던 자리를 KIM 국지모델 예보로 바꾼 것이 이 기능의 요점이다."""
+    from app.services.kma_forecast import fetch
+    k = tmp_path / "k"; k.mkdir()
+    src: list[str] = []
+    w = fetch(date(2026, 3, 15), sample_path=_sample(tmp_path),
+              kim_sample_path=_kim_sample(k), radiation_source=src)
+    assert src == ["kim_l010"], src
+    # 샘플의 누적차분은 전 시간 1.08 MJ이고 순간값 합성은 (50+100)*0.0036 = 0.54다.
+    # 1.08이 나와야 채택 경로가 누적차분이고, 야간이 0이 아니어야 추정 폴백이 아니다.
+    assert all(x["solar_rad"] == pytest.approx(1.08, abs=1e-3) for x in w)
+
+
+@needs_rad
+def test_KIM이_24시간을_못_채우면_추정으로_폴백하고_사유를_남긴다(tmp_path):
+    """일부만 예보값이고 일부는 추정값인 상태를 만들지 않는다. 다만 조용히 넘기지도 않는다."""
+    from app.services.kma_forecast import fetch
+    k = tmp_path / "k"; k.mkdir()
+    src: list[str] = []
+    w = fetch(date(2026, 3, 15), sample_path=_sample(tmp_path),
+              kim_sample_path=_kim_sample(k, hours=range(1, 18)), radiation_source=src)
+    assert src[0].startswith("estimator") and "24시간 중 17개" in src[0], src
+    night = [x["solar_rad"] for x in w if x["hour"] in (1, 2, 3, 24)]
+    assert all(v == 0 for v in night), f"폴백 경로가 아니다: 야간 {night}"
+
+
+@needs_rad
+def test_샘플_재생에서는_네트워크를_타지_않는다(tmp_path):
+    """sample_path만 주면 KIM 호출을 시도하지 않아야 한다 — 오프라인 테스트가 깨지지 않도록."""
+    from app.services.kma_forecast import fetch
+    src: list[str] = []
+    fetch(date(2026, 3, 15), sample_path=_sample(tmp_path), radiation_source=src)
+    assert src == ["estimator"], src      # 폴백 사유가 붙지 않는다 = 시도 자체를 안 했다

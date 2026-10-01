@@ -32,3 +32,19 @@ needs_data = pytest.mark.skipif(
         os.path.dirname(os.path.dirname(__file__)), "data", "raw"))),
     reason="원본 데이터가 없습니다 — DATA_DIR을 지정하세요",
 )
+
+
+@pytest.fixture(autouse=True)
+def _no_real_credentials(monkeypatch):
+    """테스트는 개발자의 키체인·환경변수에 절대 닿지 않는다.
+
+    키체인에 인증키를 등록한 뒤 '키가 없을 때' 테스트가 진짜 키를 찾아 **실제 API를
+    호출하기 시작했다.** 테스트가 네트워크를 타면 느려지고, 불안정해지고, 무엇보다
+    개발자 머신에서는 통과하는데 CI에서는 깨진다.
+
+    키가 필요한 테스트는 명시적으로 이 픽스처를 덮어쓰면 된다.
+    """
+    from app.services import credentials
+    monkeypatch.setattr(credentials, "from_keychain", lambda *a, **k: None)
+    for name in ("KMA_AUTH_KEY", "KMA_SERVICE_KEY"):
+        monkeypatch.delenv(name, raising=False)

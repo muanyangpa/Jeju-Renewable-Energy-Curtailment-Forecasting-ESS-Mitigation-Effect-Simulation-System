@@ -20,7 +20,18 @@
            실제 운영은 여기에 예보 오차가 더 얹힌다. **이 결과도 여전히 상한이다.**
            다만 상한이 두 단계로 나뉘었다: 실측 입력 > 예보 항목 입력 > 실제 예보 입력.
 
+[KIM 국지모델 일사량으로 대체하면 어떻게 되나 — 아직 측정하지 못한 부분]
+2026-09 기준으로 KIM 국지예보모델(1.5km) 표준화 NetCDF API에서 일사량 **예보값**을 직접
+받을 수 있게 됐다(app/services/kim_forecast.py). 그러면 아래 '일사량 추정'이 실제 예보값으로
+바뀌므로 정보 손실의 상당 부분이 사라질 것으로 기대된다. 다만 그 개선폭을 이 스크립트로
+재측정하려면 **테스트 구간(2025년)의 KIM 과거 예보 아카이브**가 필요하다. API가 과거
+분석시각을 얼마나 보관하는지는 scripts/verify_kim_radiation.py의 1)번 항목이 확인해준다.
+보관 기간이 짧으면 이 재측정은 불가능하고, 대신 앞으로 받는 예보와 ASOS 실측을 나란히
+쌓아가며 검증해야 한다 — 그때는 --radiation-csv로 그 값을 넣으면 된다.
+
 실행: python -m app.training.evaluate_forecast_degradation
+      python -m app.training.evaluate_forecast_degradation --radiation-csv kim.csv
+        (dt, solar_rad 두 열. 해당 시각은 추정 대신 이 값을 쓴다)
 """
 from __future__ import annotations
 
@@ -55,7 +66,15 @@ def estimate_radiation(df: pd.DataFrame) -> np.ndarray:
     return out
 
 
-def main() -> pd.DataFrame:
+def _load_radiation_csv(path: str, df: pd.DataFrame) -> tuple[np.ndarray, int]:
+    """dt·solar_rad CSV를 붙인다. 겹치는 시각만 대체하고, 몇 시간을 대체했는지 함께 돌려준다."""
+    k = pd.read_csv(path, parse_dates=["dt"]).set_index("dt")["solar_rad"]
+    joined = df["dt"].map(k)
+    n = int(joined.notna().sum())
+    return joined.to_numpy(), n
+
+
+def main(radiation_csv: str | None = None) -> pd.DataFrame:
     rows = []
     art_sol = load_artifact("converter_solar")
     t0, t1 = TEST_SPLIT["solar"]
@@ -76,6 +95,12 @@ def main() -> pd.DataFrame:
     # ② 예보 항목 입력 — 일사량은 추정, 전운량은 SKY 양자화 후 대표값
     fc = te.copy()
     fc["solar_rad"] = estimate_radiation(fc)
+    if radiation_csv:
+        # KIM 예보값이 있는 시각만 대체한다. 섞이는 것을 숨기지 않도록 비율을 찍는다.
+        kim, n = _load_radiation_csv(radiation_csv, fc)
+        fc["solar_rad"] = np.where(np.isnan(kim), fc["solar_rad"], kim)
+        print(f"  일사량: {n}/{len(fc)}시간을 KIM 예보값으로 대체, 나머지는 추정값 "
+              f"({n / len(fc) * 100:.1f}%)")
     fc["cloud"] = cloud_from_sky(fc["sky"])
     p_fore = converter_predict_mwh(art_sol, fc)
 
@@ -117,4 +142,8 @@ def main() -> pd.DataFrame:
 
 
 if __name__ == "__main__":
-    main()
+    import argparse
+
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--radiation-csv", help="dt, solar_rad — KIM 등 실제 일사량 예보값")
+    main(ap.parse_args().radiation_csv)

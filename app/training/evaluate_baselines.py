@@ -13,6 +13,17 @@ reference 세 가지 결정론적 기준선과 비교한다. 이 저장소에는
   B2 침투율 단독       발전량/수요. 출력제어의 물리적 구동 요인 그 자체.
   B3 합산 침투율 단독   (자기 발전량 + 타 발전원)/수요. 학습 없는 버전의 total_penetration.
 
+[유의성 — 점 추정만으로는 부족하다]
+"모델이 기준선보다 PR-AUC가 0.34 높다"는 문장은 그 차이가 표본 잡음보다 큰지 말하지 않는다.
+그래서 **짝지은 일(day) 블록 부트스트랩**으로 차이의 신뢰구간을 함께 낸다.
+
+  짝지어야 하는 이유 — 두 점수가 같은 데이터를 보므로 오차가 상관돼 있다. 독립 구간을
+    겹쳐보면 실제로는 유의한 차이를 '겹친다'고 오판한다.
+  날짜 블록이어야 하는 이유 — 출력제어는 날짜 단위로 뭉친다(2023년 풍력 563시간이 117일).
+    시간 단위 리샘플은 유효 표본수를 부풀려 구간을 1.6~2.1배 좁게 만든다.
+
+산출물은 models/baseline_significance.csv다. 구간이 0을 포함하면 '구분 불가'로 읽는다.
+
 [읽는 방법]
 기준선은 확률이 아니라 원시 점수다. 그래서 순위 지표(AUC·PR-AUC·top5)만 비교한다.
 Brier를 내기 위해 min-max로 [0,1]에 옮기지만 단조 변환이라 순위 지표는 바뀌지 않는다.
@@ -29,7 +40,7 @@ import os
 import numpy as np
 import pandas as pd
 
-from app.metrics import classification_report
+from app.metrics import classification_report, paired_day_block_ci
 from app.model_io import MODELS_DIR, load_artifact
 from app.serving_config import artifact_name
 from app.training.train_classifier import TEST_END, TEST_START, TRAIN_END, build_dataset
@@ -70,7 +81,7 @@ def _scores(train: pd.DataFrame, test: pd.DataFrame, names: tuple[str, ...]) -> 
 
 
 def main() -> pd.DataFrame:
-    rows = []
+    rows, sig_rows = [], []
     for energy_type, use_demand, cross, art_name, baselines in SERVED:
         df, _ = build_dataset(energy_type, use_demand, cross)
         train = df[df.dt < TRAIN_END]
@@ -80,6 +91,21 @@ def main() -> pd.DataFrame:
         art = load_artifact(art_name)
         scored = {"모델(서빙)": art["model"].predict_proba(test[art["features"]])[:, 1]}
         scored.update(_scores(train, test, baselines))
+
+        # 짝지은 일블록 부트스트랩 — 모델과 각 기준선의 차이가 표본 잡음보다 큰가
+        days = pd.DatetimeIndex(test.dt).normalize().to_numpy()
+        p_model = pd.Series(scored["모델(서빙)"]).fillna(0.0).to_numpy(dtype=float)
+        for label, s_base in scored.items():
+            if label == "모델(서빙)":
+                continue
+            b = pd.Series(s_base).fillna(0.0).to_numpy(dtype=float)
+            for metric in ("pr_auc", "top5_capture"):
+                r = paired_day_block_ci(y, p_model, b, days, metric=metric)
+                sig_rows.append({
+                    "model": art_name, "baseline": label, "metric": metric,
+                    "diff": r["diff_point"], "lo": r["lo"], "hi": r["hi"],
+                    "verdict": {"A": "모델 유의 승", "B": "기준선 승", "tie": "구분 불가"}[r["winner"]],
+                })
 
         model_rep = None
         for label, s in scored.items():
@@ -101,6 +127,9 @@ def main() -> pd.DataFrame:
     out = pd.DataFrame(rows)
     path = os.path.join(MODELS_DIR, "baseline_comparison.csv")
     out.to_csv(path, index=False)
+    sig = pd.DataFrame(sig_rows)
+    sig_path = os.path.join(MODELS_DIR, "baseline_significance.csv")
+    sig.to_csv(sig_path, index=False)
 
     for art_name, g in out.groupby("model", sort=False):
         print(f"\n[{art_name}] n={g.n.iloc[0]} 양성={g.n_pos.iloc[0]}")
@@ -109,7 +138,15 @@ def main() -> pd.DataFrame:
             gain = ("  —" if r.score == "모델(서빙)" else
                     f"  {r.pr_auc_model_gain_pct:+.1f}% / {r.top5_capture_model_gain_pct:+.1f}%")
             print(f"  {r.score:<18} {r.auc:7.4f} {r.pr_auc:8.4f} {r.top5_capture:7.4f}{gain}")
+    print("\n=== 짝지은 일블록 부트스트랩 (모델 − 기준선, 95% 구간) ===")
+    print("  구간이 0을 포함하면 구분 불가다. 점 추정만으로는 표본 잡음과 구별되지 않는다.")
+    for art_name, g in sig.groupby("model", sort=False):
+        print(f"\n[{art_name}]")
+        for _, r in g.iterrows():
+            print(f"  {r.baseline:<16} {r.metric:<13} {r['diff']:+.4f}"
+                  f"  [{r.lo:+.4f}, {r.hi:+.4f}]  {r.verdict}")
     print(f"\n저장: {path}")
+    print(f"저장: {sig_path}")
     return out
 
 
