@@ -2,6 +2,7 @@ package com.ami.curtailment.controller;
 
 import com.ami.curtailment.domain.CurtailmentPrediction;
 import com.ami.curtailment.domain.Region;
+import com.ami.curtailment.dto.CurtailmentPredictionView;
 import com.ami.curtailment.dto.HourlyPrediction;
 import com.ami.curtailment.dto.PredictionRequest;
 import com.ami.curtailment.dto.PredictionResponse;
@@ -9,6 +10,7 @@ import com.ami.curtailment.repository.CurtailmentPredictionRepository;
 import com.ami.curtailment.repository.RegionRepository;
 import com.ami.curtailment.service.AiClientService;
 import lombok.RequiredArgsConstructor;
+import org.springframework.transaction.annotation.Transactional;
 import org.springframework.web.bind.annotation.*;
 
 import java.time.LocalDate;
@@ -29,9 +31,15 @@ public class CurtailmentPredictionController {
     private final CurtailmentPredictionRepository curtailmentPredictionRepository;
 
     // 지역별 저장된 예측 결과 조회 (DB 조회, AI 서버 호출 아님)
+    // 통신규격 v1.1 07장 버그 수정: CurtailmentPrediction 엔티티를 직접 반환하면 region이
+    // Hibernate 지연 로딩 프록시로 와서 Jackson 직렬화가 500으로 실패함 - 응답 전용 DTO로 변환.
+    @Transactional(readOnly = true)
     @GetMapping("/{regionId}")
-    public List<CurtailmentPrediction> getPredictions(@PathVariable Long regionId) {
-        return curtailmentPredictionRepository.findByRegionIdOrderByTargetHourDesc(regionId);
+    public List<CurtailmentPredictionView> getPredictions(@PathVariable Long regionId) {
+        return curtailmentPredictionRepository.findByRegionIdOrderByTargetHourDesc(regionId)
+                .stream()
+                .map(CurtailmentPredictionView::new)
+                .toList();
     }
 
     /**

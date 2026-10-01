@@ -3,10 +3,12 @@ package com.ami.curtailment.controller;
 import com.ami.curtailment.domain.EssSimulationResult;
 import com.ami.curtailment.domain.Region;
 import com.ami.curtailment.dto.EssSimulateRequest;
+import com.ami.curtailment.dto.EssSimulationResultView;
 import com.ami.curtailment.repository.EssSimulationResultRepository;
 import com.ami.curtailment.repository.RegionRepository;
 import com.ami.curtailment.service.EssSimulationService;
 import lombok.RequiredArgsConstructor;
+import org.springframework.transaction.annotation.Transactional;
 import org.springframework.web.bind.annotation.*;
 
 import java.time.LocalDate;
@@ -26,9 +28,15 @@ public class EssSimulationController {
     private final EssSimulationResultRepository essSimulationResultRepository;
     private final RegionRepository regionRepository;
 
+    // 통신규격 v1.1 07장과 같은 원인(Hibernate 지연 로딩 프록시 직렬화 실패)을 예방하기 위해
+    // CurtailmentPredictionController와 동일하게 응답 전용 DTO로 변환해서 반환.
+    @Transactional(readOnly = true)
     @GetMapping("/{regionId}")
-    public List<EssSimulationResult> getResults(@PathVariable Long regionId) {
-        return essSimulationResultRepository.findByRegionIdOrderByTargetDateDesc(regionId);
+    public List<EssSimulationResultView> getResults(@PathVariable Long regionId) {
+        return essSimulationResultRepository.findByRegionIdOrderByTargetDateDesc(regionId)
+                .stream()
+                .map(EssSimulationResultView::new)
+                .toList();
     }
 
     @PostMapping
